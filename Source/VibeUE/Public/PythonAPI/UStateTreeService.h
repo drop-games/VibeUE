@@ -822,6 +822,47 @@ public:
 	                                                int32 TaskMatchIndex = -1, int32 GlobalTaskMatchIndex = -1);
 
 	/**
+	 * Bind any node property to a property exposed by a GLOBAL EVALUATOR.
+	 *
+	 * This is the binding most gameplay StateTrees are actually made of: an evaluator perceives the
+	 * world and publishes facts as properties, and every task and condition reads them from there.
+	 * Without it, a tree can be built from script but not wired, which is the same as not built.
+	 *
+	 * @param TargetKind        "Task", "EnterCondition", "TransitionCondition", or "Evaluator".
+	 * @param StatePath         State owning the target node. Ignored for TargetKind "Evaluator".
+	 * @param TargetStructName  Struct name of the target node.
+	 * @param TransitionIndex   Only used for TargetKind "TransitionCondition".
+	 * @param TargetMatchIndex  Which matching target node. -1 means the last matching one.
+	 * @param EvaluatorMatchIndex Which matching evaluator. -1 means the last matching one.
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|StateTree")
+	static bool BindPropertyToEvaluatorProperty(const FString& AssetPath, const FString& TargetKind,
+	                                            const FString& StatePath, const FString& TargetStructName,
+	                                            const FString& TargetPropertyPath,
+	                                            const FString& EvaluatorStructName, const FString& EvaluatorPropertyPath,
+	                                            int32 TransitionIndex = -1,
+	                                            int32 TargetMatchIndex = -1, int32 EvaluatorMatchIndex = -1);
+
+	/**
+	 * Bind any node property to a property exposed by a TASK ON ANOTHER STATE — typically a decision
+	 * task on a PARENT state whose outputs the children consume.
+	 *
+	 * Source state must be the target's own state or one of its ancestors; StateTree instance data
+	 * lives and dies with its state, so a binding to a sibling's task reads defaults, not results.
+	 *
+	 * @param TargetKind        "Task", "EnterCondition", "TransitionCondition", or "Evaluator".
+	 * @param TransitionIndex   Only used for TargetKind "TransitionCondition".
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|StateTree")
+	static bool BindPropertyToStateTaskProperty(const FString& AssetPath, const FString& TargetKind,
+	                                            const FString& StatePath, const FString& TargetStructName,
+	                                            const FString& TargetPropertyPath,
+	                                            const FString& SourceStatePath, const FString& SourceTaskStructName,
+	                                            const FString& SourceTaskPropertyPath,
+	                                            int32 TransitionIndex = -1,
+	                                            int32 TargetMatchIndex = -1, int32 SourceTaskMatchIndex = -1);
+
+	/**
 	 * Remove the property binding on a task property (unbind it).
 	 * After unbinding, the property reverts to its default/unbound value.
 	 * @param TaskMatchIndex Which matching task to target for the struct type. -1 means the last matching task.

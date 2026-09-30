@@ -6804,3 +6804,210 @@ bool UStateTreeService::SaveStateTree(const FString& AssetPath)
 	}
 	return bSaved;
 }
+
+// ── Generic bindings: evaluator outputs and parent-state task outputs ────────
+//
+// The existing Bind* family covers root parameters, context objects, and global TASKS.  Real gameplay
+// trees are mostly made of the two sources it did not cover:
+//
+//   * a global EVALUATOR's outputs — the standard "evaluators perceive, tasks act, conditions only
+//     compare" split means every fact a condition tests came from an evaluator; and
+//   * a task on a PARENT state — the standard "decision task on the parent, children bind its outputs"
+//     layout.
+//
+// Without these, a tree can be created from script but not wired, which is the same as not created.
+
+#if WITH_EDITORONLY_DATA
+namespace VibeUEStateTreeBindings
+{
+	/**
+	 * Resolves the node a binding is being written INTO.
+	 *
+	 * TargetKind is a string rather than an enum so the Python surface stays declarative and no new
+	 * UENUM has to be registered for what is really a four-way switch.
+	 */
+	static FStateTreeEditorNode* ResolveTargetNode(UStateTreeEditorData* EditorData, const FString& TargetKind,
+		const FString& StatePath, const FString& TargetStructName, int32 TransitionIndex, int32 TargetMatchIndex,
+		const TCHAR* CallerName)
+	{
+		if (TargetKind.Equals(TEXT("Evaluator"), ESearchCase::IgnoreCase))
+		{
+			return FindEditorNodeByStructInArray(EditorData->Evaluators, TargetStructName, TargetMatchIndex);
+		}
+
+		UStateTreeState* State = FindStateByPath(EditorData, StatePath);
+		if (!State)
+		{
+			UE_LOG(LogStateTreeService, Warning, TEXT("%s: State not found: %s"), CallerName, *StatePath);
+			return nullptr;
+		}
+
+		if (TargetKind.Equals(TEXT("Task"), ESearchCase::IgnoreCase))
+		{
+			return FindTaskNodeByStruct(State, TargetStructName, TargetMatchIndex);
+		}
+		if (TargetKind.Equals(TEXT("EnterCondition"), ESearchCase::IgnoreCase))
+		{
+			return FindEditorNodeByStructInArray(State->EnterConditions, TargetStructName, TargetMatchIndex);
+		}
+		if (TargetKind.Equals(TEXT("TransitionCondition"), ESearchCase::IgnoreCase))
+		{
+			if (!State->Transitions.IsValidIndex(TransitionIndex))
+			{
+				UE_LOG(LogStateTreeService, Warning,
+					TEXT("%s: TransitionIndex %d out of range on %s (%d transitions). ")
+					TEXT("TransitionIndex is required for TargetKind 'TransitionCondition'."),
+					CallerName, TransitionIndex, *StatePath, State->Transitions.Num());
+				return nullptr;
+			}
+			return FindEditorNodeByStructInArray(State->Transitions[TransitionIndex].Conditions,
+				TargetStructName, TargetMatchIndex);
+		}
+
+		UE_LOG(LogStateTreeService, Warning,
+			TEXT("%s: Unknown TargetKind '%s'. Expected Task, EnterCondition, TransitionCondition, or Evaluator."),
+			CallerName, *TargetKind);
+		return nullptr;
+	}
+
+	/** Writes the binding once both ends have resolved to a node ID + property path. */
+	static bool AddBinding(UStateTree* StateTree, UStateTreeEditorData* EditorData,
+		const FGuid& SourceID, const FString& SourcePropertyPath,
+		const FGuid& TargetID, const FString& TargetPropertyPath, const TCHAR* CallerName)
+	{
+		FPropertyBindingPath SourcePath;
+		if (!MakeBindingPath(SourceID, SourcePropertyPath, SourcePath))
+		{
+			UE_LOG(LogStateTreeService, Warning, TEXT("%s: Invalid source property path: %s"),
+				CallerName, *SourcePropertyPath);
+			return false;
+		}
+
+		FPropertyBindingPath TargetPath;
+		if (!MakeBindingPath(TargetID, TargetPropertyPath, TargetPath))
+		{
+			UE_LOG(LogStateTreeService, Warning, TEXT("%s: Invalid target property path: %s"),
+				CallerName, *TargetPropertyPath);
+			return false;
+		}
+
+		EditorData->AddPropertyBinding(SourcePath, TargetPath);
+		MarkStateTreeDirty(StateTree);
+		return true;
+	}
+}
+#endif
+
+bool UStateTreeService::BindPropertyToEvaluatorProperty(const FString& AssetPath, const FString& TargetKind,
+	const FString& StatePath, const FString& TargetStructName, const FString& TargetPropertyPath,
+	const FString& EvaluatorStructName, const FString& EvaluatorPropertyPath,
+	int32 TransitionIndex, int32 TargetMatchIndex, int32 EvaluatorMatchIndex)
+{
+	static const TCHAR* Caller = TEXT("BindPropertyToEvaluatorProperty");
+
+	if (TargetPropertyPath.IsEmpty() || EvaluatorPropertyPath.IsEmpty())
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("%s: TargetPropertyPath and EvaluatorPropertyPath are required"), Caller);
+		return false;
+	}
+
+	UStateTree* StateTree = LoadStateTree(AssetPath);
+	if (!StateTree)
+	{
+		return false;
+	}
+
+#if WITH_EDITORONLY_DATA
+	UStateTreeEditorData* EditorData = GetEditorData(StateTree);
+	if (!EditorData)
+	{
+		return false;
+	}
+
+	const FStateTreeEditorNode* EvalNode =
+		FindEditorNodeByStructInArray(EditorData->Evaluators, EvaluatorStructName, EvaluatorMatchIndex);
+	if (!EvalNode)
+	{
+		UE_LOG(LogStateTreeService, Warning,
+			TEXT("%s: Evaluator not found for struct '%s' at match index %d (%d evaluators on the tree)"),
+			Caller, *EvaluatorStructName, EvaluatorMatchIndex, EditorData->Evaluators.Num());
+		return false;
+	}
+
+	const FStateTreeEditorNode* TargetNode = VibeUEStateTreeBindings::ResolveTargetNode(
+		EditorData, TargetKind, StatePath, TargetStructName, TransitionIndex, TargetMatchIndex, Caller);
+	if (!TargetNode)
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("%s: Target node '%s' (%s) not found"),
+			Caller, *TargetStructName, *TargetKind);
+		return false;
+	}
+
+	return VibeUEStateTreeBindings::AddBinding(StateTree, EditorData,
+		EvalNode->ID, EvaluatorPropertyPath, TargetNode->ID, TargetPropertyPath, Caller);
+#else
+	return false;
+#endif
+}
+
+bool UStateTreeService::BindPropertyToStateTaskProperty(const FString& AssetPath, const FString& TargetKind,
+	const FString& StatePath, const FString& TargetStructName, const FString& TargetPropertyPath,
+	const FString& SourceStatePath, const FString& SourceTaskStructName, const FString& SourceTaskPropertyPath,
+	int32 TransitionIndex, int32 TargetMatchIndex, int32 SourceTaskMatchIndex)
+{
+	static const TCHAR* Caller = TEXT("BindPropertyToStateTaskProperty");
+
+	if (TargetPropertyPath.IsEmpty() || SourceTaskPropertyPath.IsEmpty())
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("%s: TargetPropertyPath and SourceTaskPropertyPath are required"), Caller);
+		return false;
+	}
+
+	UStateTree* StateTree = LoadStateTree(AssetPath);
+	if (!StateTree)
+	{
+		return false;
+	}
+
+#if WITH_EDITORONLY_DATA
+	UStateTreeEditorData* EditorData = GetEditorData(StateTree);
+	if (!EditorData)
+	{
+		return false;
+	}
+
+	UStateTreeState* SourceState = FindStateByPath(EditorData, SourceStatePath);
+	if (!SourceState)
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("%s: Source state not found: %s"), Caller, *SourceStatePath);
+		return false;
+	}
+
+	const FStateTreeEditorNode* SourceTask =
+		FindTaskNodeByStruct(SourceState, SourceTaskStructName, SourceTaskMatchIndex);
+	if (!SourceTask)
+	{
+		UE_LOG(LogStateTreeService, Warning,
+			TEXT("%s: Source task '%s' not found on %s at match index %d"),
+			Caller, *SourceTaskStructName, *SourceStatePath, SourceTaskMatchIndex);
+		return false;
+	}
+
+	const FStateTreeEditorNode* TargetNode = VibeUEStateTreeBindings::ResolveTargetNode(
+		EditorData, TargetKind, StatePath, TargetStructName, TransitionIndex, TargetMatchIndex, Caller);
+	if (!TargetNode)
+	{
+		UE_LOG(LogStateTreeService, Warning, TEXT("%s: Target node '%s' (%s) not found"),
+			Caller, *TargetStructName, *TargetKind);
+		return false;
+	}
+
+	// Not validated here: that SourceStatePath is the target's own state or an ancestor of it.  The
+	// StateTree compiler already rejects out-of-scope bindings with a precise message, and duplicating
+	// the scope rule here would be a second copy of it to drift.
+	return VibeUEStateTreeBindings::AddBinding(StateTree, EditorData,
+		SourceTask->ID, SourceTaskPropertyPath, TargetNode->ID, TargetPropertyPath, Caller);
+#else
+	return false;
+#endif
+}

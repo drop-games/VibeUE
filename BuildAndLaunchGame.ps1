@@ -4,8 +4,19 @@
 
 param(
     [string]$Mode = "Development",
+    [string]$EngineRoot = "",
+    # Extra editor flags for diagnostics, for example -log.
+    [string]$EditorArguments = "",
     [switch]$Clean,
     [switch]$SkipBuild,
+    # Build only, leaving an editor opened by another task untouched.
+    [switch]$SkipLaunch,
+    # Launch alongside other editor sessions instead of closing them.
+    [switch]$KeepOtherEditors,
+    # Compile on this computer, without sending source to Horde/UBA or another remote executor.
+    [switch]$LocalBuild,
+    # Keep automation evidence and editor logs across a validation rebuild.
+    [switch]$PreserveLogs,
     # Force a full recompile of the VibeUE plugin under strict settings.
     # Strict compilation (warnings-as-errors / deprecation-as-error) is enforced
     # module-wide via VibeUE.Build.cs (bWarningsAsErrors = true), so every build is
@@ -57,11 +68,13 @@ $uprojectJson = Get-Content $projectPath -Raw | ConvertFrom-Json
 $engineAssociation = $uprojectJson.EngineAssociation
 
 # First try: look up custom/source builds from registry (HKCU)
-$enginePath = $null
+$enginePath = if ($EngineRoot) { (Resolve-Path -LiteralPath $EngineRoot).Path } else { $null }
 try {
+    if (-not $enginePath) {
     $customBuilds = Get-ItemProperty "HKCU:\SOFTWARE\Epic Games\Unreal Engine\Builds" -ErrorAction SilentlyContinue
     if ($customBuilds -and $customBuilds.$engineAssociation) {
         $enginePath = $customBuilds.$engineAssociation
+    }
     }
 } catch {}
 
@@ -82,13 +95,22 @@ if (-not $enginePath) {
         "E:\Program Files\Epic Games\UE_$engineAssociation",
         "C:\Program Files\Epic Games\UE_$engineAssociation",
         "D:\Program Files\Epic Games\UE_$engineAssociation"
+        "G:\Program Files\Epic Games\UE_$engineAssociation"
     )
     foreach ($c in $candidates) {
         if (Test-Path $c) { $enginePath = $c; break }
     }
 }
 
-# Fourth try: ask for a manual path rather than just giving up (the Epic launcher
+# Fourth try: a source-engine checkout containing this project as a sibling of Engine.
+if (-not $enginePath) {
+    $sourceEngineRoot = Split-Path $projectRoot -Parent
+    if (Test-Path (Join-Path $sourceEngineRoot "Engine\Build\BatchFiles\Build.bat")) {
+        $enginePath = $sourceEngineRoot
+    }
+}
+
+# Last try: ask for a manual path rather than just giving up (the Epic launcher
 # doesn't always register a drive, e.g. an engine installed on a non-default drive).
 if (-not $enginePath) {
     Write-Host "Could not auto-detect Unreal Engine '$engineAssociation' from the registry or common install paths." -ForegroundColor Yellow
@@ -122,12 +144,12 @@ Write-Host "Engine  : $enginePath" -ForegroundColor Yellow
 Write-Host "Mode    : $Mode" -ForegroundColor Yellow
 
 # Stop any running Unreal Engine processes gracefully
-$unrealProcesses = Get-Process | Where-Object { 
+$unrealProcesses = if ($KeepOtherEditors -or $SkipLaunch) { @() } else { Get-Process | Where-Object {
     $_.ProcessName -like "UnrealEditor*" -or 
     $_.ProcessName -like "CrashReportClient*" -or 
     $_.ProcessName -eq "UnrealTraceServer" -or
     ($_.ProcessName -eq "crashpad_handler" -and $_.MainModule.FileName -like "*Epic Games*")
-}
+} }
 
 if ($unrealProcesses) {
     Write-Host "Requesting Unreal Engine processes to close gracefully..." -ForegroundColor Yellow
@@ -223,7 +245,12 @@ if ($StrictRebuild -and -not $Clean) {
 if (-not $SkipBuild) {
     Write-Host "Building $projectName in $Mode mode (strict: warnings-as-errors via VibeUE.Build.cs)..." -ForegroundColor Yellow
     
-    & $buildBat "${projectName}Editor" Win64 $Mode $projectPath -waitmutex
+    $projectBuildArgs = @("${projectName}Editor", "Win64", $Mode, $projectPath, "-waitmutex")
+    if ($LocalBuild) {
+        $projectBuildArgs += @("-NoUBA", "-NoXGE", "-NoFASTBuild", "-NoSNDBS")
+        Write-Host "Local build: all remote executors disabled." -ForegroundColor Yellow
+    }
+    & $buildBat @projectBuildArgs
     
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Build failed! Exit code: $LASTEXITCODE" -ForegroundColor Red
@@ -235,6 +262,12 @@ if (-not $SkipBuild) {
     Write-Host "Skipping build..." -ForegroundColor Yellow
 }
 
+if ($SkipLaunch) {
+    Write-Host "Build complete; leaving running editor sessions untouched." -ForegroundColor Green
+    exit 0
+}
+
+if (-not $PreserveLogs) {
 # Clear logs folder (relative to project root)
 Write-Host "Clearing all files in logs folder..." -ForegroundColor Yellow
 $logsPath = Join-Path $projectRoot "Saved\Logs"
@@ -270,13 +303,23 @@ if (Test-Path $agentConversationsPath) {
 }
 
 # Launch Unreal Editor
+}
+
 Write-Host "Launching Unreal Editor..." -ForegroundColor Yellow
 
 # The project path MUST be quoted: -ArgumentList passes the string to the child process
 # verbatim, so a path with a space (e.g. Documents\Unreal Projects, Unreal's default
 # location) arrives as two invalid arguments and the editor silently opens the last
 # project or the Project Browser instead (issue #532).
-$editorProcess = Start-Process -FilePath $editorExe -ArgumentList "`"$projectPath`"" -PassThru
+$editorArgs = "`"$projectPath`""
+if ($EditorArguments) { $editorArgs += " $EditorArguments" }
+if ($LocalBuild) {
+    # Keep the editor's shader controller local as well as the build executor.
+    $shaderWorkingDir = Join-Path $projectRoot "Saved\ShaderWorking"
+    New-Item -ItemType Directory -Path $shaderWorkingDir -Force | Out-Null
+    $editorArgs += " -NoUbaController -ShaderWorkingDir=`"$shaderWorkingDir`""
+}
+$editorProcess = Start-Process -FilePath $editorExe -ArgumentList $editorArgs -PassThru
 
 # Windows recycles process IDs, so an Editor that crashed without running OnPreExit can leave a signal
 # file whose name matches the PID we just got. VibeUE also clears it in RegisterToolsets(), but that runs

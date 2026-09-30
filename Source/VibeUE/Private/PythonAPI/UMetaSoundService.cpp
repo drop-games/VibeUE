@@ -38,7 +38,8 @@ namespace
 	FMetasoundFrontendLiteral MakeLiteral(const FString& Value, const FString& DataType)
 	{
 		FMetasoundFrontendLiteral Lit;
-		if (DataType.Equals(TEXT("Float"), ESearchCase::IgnoreCase))
+		if (DataType.Equals(TEXT("Float"), ESearchCase::IgnoreCase)
+			|| DataType.Equals(TEXT("Time"), ESearchCase::IgnoreCase))
 		{
 			Lit.Set(FCString::Atof(*Value));
 		}
@@ -52,6 +53,12 @@ namespace
 			const bool bVal = Value.TrimStartAndEnd().Equals(TEXT("true"), ESearchCase::IgnoreCase)
 			               || Value.TrimStartAndEnd().Equals(TEXT("1"), ESearchCase::IgnoreCase);
 			Lit.Set(bVal);
+		}
+		else if (DataType.Equals(TEXT("Trigger"), ESearchCase::IgnoreCase))
+		{
+			// Trigger defaults must be Boolean (or None). A String literal
+			// asserts in UMetaSoundSource::MakeAudioParameter at runtime.
+			Lit.Set(false);
 		}
 		else
 		{
