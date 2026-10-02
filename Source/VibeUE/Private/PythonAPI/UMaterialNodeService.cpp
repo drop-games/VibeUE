@@ -27,6 +27,7 @@
 #include "Materials/MaterialExpressionFunctionOutput.h"
 #include "Materials/MaterialExpressionCustomOutput.h"
 #include "Materials/MaterialExpressionNamedReroute.h"
+#include "Materials/MaterialExpressionComment.h"
 #include "Materials/MaterialFunction.h"
 #include "Materials/MaterialParameterCollection.h"
 #include "LandscapeGrassType.h"
@@ -154,10 +155,14 @@ UMaterialExpression* UMaterialNodeService::FindExpressionById(UMaterial* Materia
 	
 	TArray<UMaterialExpression*> Expressions;
 	Material->GetAllExpressionsInMaterialAndFunctionsOfType<UMaterialExpression>(Expressions);
+	for (UMaterialExpressionComment* Comment : Material->GetEditorComments())
+	{
+		Expressions.AddUnique(Comment);
+	}
 	
 	for (UMaterialExpression* Expression : Expressions)
 	{
-		if (GetExpressionId(Expression) == ExpressionId)
+		if (Expression && (GetExpressionId(Expression) == ExpressionId || Expression->GetName() == ExpressionId))
 		{
 			return Expression;
 		}
@@ -787,6 +792,10 @@ TArray<FMaterialExpressionInfo> UMaterialNodeService::ListExpressions(const FStr
 	
 	TArray<UMaterialExpression*> Expressions;
 	Material->GetAllExpressionsInMaterialAndFunctionsOfType<UMaterialExpression>(Expressions);
+	for (UMaterialExpressionComment* Comment : Material->GetEditorComments())
+	{
+		Expressions.AddUnique(Comment);
+	}
 	
 	for (UMaterialExpression* Expression : Expressions)
 	{
@@ -1602,6 +1611,7 @@ int32 UMaterialNodeService::BatchSetProperties(
 	Material->Modify();
 
 	int32 SuccessCount = 0;
+	TArray<UMaterialExpressionComment*> UpdatedComments;
 	for (int32 i = 0; i < Count; i++)
 	{
 		UMaterialExpression* Expression = FindExpressionById(Material, ExpressionIds[i]);
@@ -1617,6 +1627,10 @@ int32 UMaterialNodeService::BatchSetProperties(
 		}
 
 		Expression->Modify();
+		if (UMaterialExpressionComment* Comment = Cast<UMaterialExpressionComment>(Expression))
+		{
+			UpdatedComments.AddUnique(Comment);
+		}
 		void* PropertyPtr = Property->ContainerPtrToValuePtr<void>(Expression);
 
 		// Handle FLinearColor
@@ -1645,6 +1659,19 @@ int32 UMaterialNodeService::BatchSetProperties(
 		}
 	}
 
+	// MEL's generic expression factory places comments in Expressions. Store them in
+	// the dedicated editor collection, preserving object identity and other comments.
+	for (UMaterialExpressionComment* Comment : UpdatedComments)
+	{
+		Material->GetExpressionCollection().RemoveExpression(Comment);
+		Material->GetExpressionCollection().AddComment(Comment);
+	}
+	// Property edits are authoritative. Linking from the old graph first would undo
+	// imported positions/comment sizes (and can erase newly authored connections).
+	if (UMaterialGraph* Graph = Cast<UMaterialGraph>(Material->MaterialGraph))
+	{
+		Graph->RebuildGraph();
+	}
 	// Single refresh at end
 	RefreshMaterialGraph(Material);
 
@@ -1945,6 +1972,10 @@ FString UMaterialNodeService::ExportMaterialGraph(const FString& MaterialPath)
 	TArray<TSharedPtr<FJsonValue>> ExpressionsArray;
 	TArray<UMaterialExpression*> AllExpressions;
 	Material->GetAllExpressionsInMaterialAndFunctionsOfType<UMaterialExpression>(AllExpressions);
+	for (UMaterialExpressionComment* Comment : Material->GetEditorComments())
+	{
+		AllExpressions.AddUnique(Comment);
+	}
 
 	// Only include top-level expressions (not inside material functions)
 	TArray<UMaterialExpression*> TopLevelExpressions;
