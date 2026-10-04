@@ -292,6 +292,41 @@ namespace
 		}
 	}
 
+	/**
+	 * Restore the engine's invariant that a dynamic-pin node's "Add" pins come last.
+	 *
+	 * UEdGraphNode::CreatePin appends, so a pin created directly lands AFTER the node's Add pin; the
+	 * engine's own RequestNewTypedPin instead retypes the Add pin in place and appends a fresh one.
+	 * The difference is invisible until the graph is loaded and walked again:
+	 * UNiagaraNodeCustomHlsl::BuildParameterMapHistory pairs input pin i with Signature.Inputs[i],
+	 * skipping only the Add pin, so an Add pin at the front shifts every pin onto the wrong signature
+	 * entry and the last one reads past the end — "Array index out of bounds: N into an array of size N"
+	 * (N = the node's input count), killing the editor the first time a loaded system recompiles or a
+	 * stack view model is built for it.  Returns true if the order changed.
+	 */
+	bool MoveAddPinsLast(UEdGraphNode* Node)
+	{
+		static const FName AddPinSubCategory(TEXT("DynamicAddPin"));
+		auto IsAdd = [](const UEdGraphPin* Pin)
+		{
+			return Pin && Pin->PinType.PinCategory == UEdGraphSchema_Niagara::PinCategoryMisc
+				&& Pin->PinType.PinSubCategory == AddPinSubCategory;
+		};
+
+		TArray<UEdGraphPin*> Ordered;
+		Ordered.Reserve(Node->Pins.Num());
+		for (UEdGraphPin* Pin : Node->Pins) { if (!IsAdd(Pin)) Ordered.Add(Pin); }
+		for (UEdGraphPin* Pin : Node->Pins) { if (IsAdd(Pin))  Ordered.Add(Pin); }
+
+		if (Ordered == Node->Pins)
+		{
+			return false;
+		}
+		Node->Modify();
+		Node->Pins = MoveTemp(Ordered);
+		return true;
+	}
+
 	/** Build an FEdGraphPinType for a Niagara type using the exported schema helper. */
 	FEdGraphPinType MakeNiagaraPinType(const FNiagaraTypeDefinition& Type)
 	{
@@ -887,6 +922,15 @@ FNiagaraScratchResult UNiagaraScratchPadService::AddPin(
 	}
 
 	if (!NewPin) { R.Message = TEXT("CreatePin returned null"); return R; }
+
+	// CreatePin appended the new pin after the Add pin; put the Add pins back at the end, where the
+	// engine keeps them (see MoveAddPinsLast).  The Custom HLSL signature was rebuilt from the old
+	// order above and the relative order of real pins is unchanged, but rebuild again to be exact.
+	if (MoveAddPinsLast(Node) && Node->IsA<UNiagaraNodeCustomHlsl>())
+	{
+		RebuildCustomHlslSignatureFromPins(Node);
+	}
+
 	R.bSuccess = true; R.Message = NewPin->PinName.ToString(); R.NodeId = NodeId;
 
 	Graph->NotifyGraphChanged();
@@ -1187,7 +1231,11 @@ namespace
 					TSet<FName> OutputNames;
 					for (const UEdGraphPin* Pin : Node->Pins)
 					{
-						if (!Pin) continue;
+						// Unnamed pins are the default-value inputs a Map Get keeps beside each output
+						// (UNiagaraNodeParameterMapGet synthesizes them on load, one per output, all
+						// NAME_None).  Several are normal and compile fine; only NAMED duplicates are a
+						// problem.  Flagging them made every loaded Map Get with 2+ outputs unappliable.
+						if (!Pin || Pin->PinName.IsNone()) continue;
 						TSet<FName>& Names = (Pin->Direction == EGPD_Input) ? InputNames : OutputNames;
 						bool bAlreadyThere = false;
 						Names.Add(Pin->PinName, &bAlreadyThere);
@@ -1261,6 +1309,31 @@ bool UNiagaraScratchPadService::ApplyChanges(const FString& SystemPath)
 {
 	UNiagaraSystem* System = LoadSystem(SystemPath);
 	if (!System) return false;
+
+	// Repair graphs built before AddPin kept Add pins last: saved in that order they compile in the
+	// session that built them and assert on the first recompile after a load (see MoveAddPinsLast).
+	for (FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+	{
+		FVersionedNiagaraEmitterData* EmitterData = Handle.GetEmitterData();
+		if (!EmitterData || !EmitterData->ScratchPads) continue;
+		for (UNiagaraScript* Scratch : EmitterData->ScratchPads->Scripts)
+		{
+			const auto* Src = Scratch ? Cast<UNiagaraScriptSource>(Scratch->GetLatestSource()) : nullptr;
+			if (!Src || !Src->NodeGraph) continue;
+			for (UEdGraphNode* Node : Src->NodeGraph->Nodes)
+			{
+				if (Node && Cast<UNiagaraNodeWithDynamicPins>(Node) && MoveAddPinsLast(Node))
+				{
+					if (Node->IsA<UNiagaraNodeCustomHlsl>())
+					{
+						RebuildCustomHlslSignatureFromPins(Node);
+					}
+					UE_LOG(LogTemp, Display, TEXT("ApplyChanges: moved Add pins last on %s in scratch module '%s'"),
+						*Node->GetClass()->GetName(), *Scratch->GetName());
+				}
+			}
+		}
+	}
 
 	// Refuse to compile a corrupt scratch graph — the engine assert it would fire is fatal.
 	FString ValidationError;
