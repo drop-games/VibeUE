@@ -5,11 +5,17 @@
 #if WITH_AUTOMATION_TESTS
 
 #include "PythonAPI/PerformanceVerdict.h"
+#include "PythonAPI/PerformanceAnalysis.h"
 #include "PythonAPI/UPerformanceService.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Dom/JsonObject.h"
 #include "HAL/FileManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Editor.h"
+#include "Editor/EditorEngine.h"
+#include "Editor/EditorPerformanceSettings.h"
 
 // Pure verdict/budget logic (PerformanceVerdict.h) is exercised headless — no editor, no live frame
 // globals — and FrameTiming routes through the same helpers, so green here means the shipping verdict
@@ -371,9 +377,9 @@ bool FVibePerfForceHitchRhiTest::RunTest(const FString&)
 	return true;
 }
 
-// Report() renders a self-contained HTML "printout" from the live verdict + capture summary. Headless
-// (nullrhi, no trace) exercises the no-capture path: the file must still be written and the JSON contract
-// (report_file / fix_count / included_capture) honoured.
+// Report() renders a self-contained HTML "printout" from the live verdict + optional capture summary.
+// The file must be written and the JSON contract honoured whether another test/session has already
+// populated the process-global last-capture state or not.
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVibePerfReportSmokeTest,
 	"VibeUE.Performance.Report.WritesFile", kPerfTestFlags)
 bool FVibePerfReportSmokeTest::RunTest(const FString&)
@@ -395,9 +401,6 @@ bool FVibePerfReportSmokeTest::RunTest(const FString&)
 	TestTrue(TEXT("has fix_count"), Obj->HasField(TEXT("fix_count")));
 	TestTrue(TEXT("has included_capture"), Obj->HasField(TEXT("included_capture")));
 
-	// No trace is available headless, so the capture column must be absent.
-	TestFalse(TEXT("no capture headless"), Obj->GetBoolField(TEXT("included_capture")));
-
 	// The reported path must point at a real, non-empty file on disk.
 	const FString Path = Obj->GetStringField(TEXT("report_file"));
 	TestTrue(TEXT("report_file non-empty"), !Path.IsEmpty());
@@ -407,6 +410,156 @@ bool FVibePerfReportSmokeTest::RunTest(const FString&)
 		TestTrue(TEXT("file has content"), FM.FileSize(*Path) > 0);
 		FM.Delete(*Path); // don't litter the project's Saved dir with test artifacts
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVibePerfPsoSummaryTest,
+	"VibeUE.Performance.Analysis.PsoCumulativeSummary", kPerfTestFlags)
+bool FVibePerfPsoSummaryTest::RunTest(const FString&)
+{
+	const FString Path = FPaths::ProjectSavedDir() / TEXT("VibeUE/Tests/performance_pso.log");
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true);
+	const FString Log = TEXT("LogRHI: Warning: 50 PSO creation hitches so far\n")
+		TEXT("LogRHI: Warning: 50 PSO creation hitches so far\n")
+		TEXT("LogRHI: Warning: PSO creation hitch while compiling Foo\n");
+	if (!FFileHelper::SaveStringToFile(Log, *Path))
+	{
+		AddError(TEXT("Could not write PSO fixture log"));
+		return false;
+	}
+
+	const FString Json = VibeUEPerformanceAnalysis::AnalyseLogs(Path);
+	TSharedPtr<FJsonObject> Obj;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	TestTrue(TEXT("valid JSON"), FJsonSerializer::Deserialize(Reader, Obj) && Obj.IsValid());
+	if (Obj.IsValid())
+	{
+		TestTrue(TEXT("success"), Obj->GetBoolField(TEXT("success")));
+		TestEqual(TEXT("two summary lines"), (int32)Obj->GetNumberField(TEXT("pso_hitch_summary_lines")), 2);
+		TestEqual(TEXT("one event line"), (int32)Obj->GetNumberField(TEXT("pso_hitch_event_lines")), 1);
+		TestEqual(TEXT("cumulative summaries not summed"), (int32)Obj->GetNumberField(TEXT("pso_hitches_reported")), 50);
+		TestEqual(TEXT("best supported count"), (int32)Obj->GetNumberField(TEXT("pso_hitches")), 50);
+	}
+	IFileManager::Get().Delete(*Path);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVibePerfPartialAnalysisTest,
+	"VibeUE.Performance.Analysis.MissingTraceIsPartial", kPerfTestFlags)
+bool FVibePerfPartialAnalysisTest::RunTest(const FString&)
+{
+	const FString FixtureLogPath = FPaths::ProjectSavedDir() / TEXT("VibeUE/Tests/performance_partial.log");
+	const FString MissingTrace = FPaths::ProjectSavedDir() / TEXT("VibeUE/Tests/does_not_exist.utrace");
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(FixtureLogPath), true);
+	FFileHelper::SaveStringToFile(TEXT("LogTemp: Display: usable log\n"), *FixtureLogPath);
+
+	const FString Json = VibeUEPerformanceAnalysis::AnalyseBoth(MissingTrace, FixtureLogPath);
+	TSharedPtr<FJsonObject> Obj;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	TestTrue(TEXT("valid JSON"), FJsonSerializer::Deserialize(Reader, Obj) && Obj.IsValid());
+	if (Obj.IsValid())
+	{
+		TestFalse(TEXT("partial is not top-level success"), Obj->GetBoolField(TEXT("success")));
+		TestTrue(TEXT("partial flag"), Obj->GetBoolField(TEXT("partial")));
+		TestEqual(TEXT("partial status"), Obj->GetStringField(TEXT("status")), FString(TEXT("partial")));
+		TestFalse(TEXT("trace failed"), Obj->GetObjectField(TEXT("trace"))->GetBoolField(TEXT("success")));
+		TestTrue(TEXT("logs succeeded"), Obj->GetObjectField(TEXT("logs"))->GetBoolField(TEXT("success")));
+	}
+	IFileManager::Get().Delete(*FixtureLogPath);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVibePerfStandaloneNameTest,
+	"VibeUE.Performance.Standalone.UniqueSessionDestinations", kPerfTestFlags)
+bool FVibePerfStandaloneNameTest::RunTest(const FString&)
+{
+	const FString First = VibeUEPerformanceAnalysis::MakeStandaloneSessionStem(TEXT("repeat/name"));
+	const FString Second = VibeUEPerformanceAnalysis::MakeStandaloneSessionStem(TEXT("repeat/name"));
+	TestNotEqual(TEXT("successive sessions have distinct destinations"), First, Second);
+	TestFalse(TEXT("unsafe slash removed"), First.Contains(TEXT("/")));
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Background-throttling hook teardown
+// ---------------------------------------------------------------------------
+
+// The bug: SetBackgroundThrottling registered a ShouldDisableCPUThrottlingDelegates lambda (code in this DLL)
+// once, behind a function-local static, and nothing ever removed it: not on re-enable, not at module
+// shutdown. Now the entry exists exactly while throttling is off, ShutdownThrottlingHook removes it and puts
+// the setting back to its value from before the override, and a second shutdown is a no-op.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVibePerfThrottlingHookTeardownTest,
+	"VibeUE.Performance.BackgroundThrottling.HookTeardown", kPerfTestFlags)
+bool FVibePerfThrottlingHookTeardownTest::RunTest(const FString&)
+{
+	if (!GEditor)
+	{
+		AddError(TEXT("Needs GEditor (ShouldDisableCPUThrottlingDelegates lives on the editor engine)."));
+		return false;
+	}
+	UEditorPerformanceSettings* Settings = GetMutableDefault<UEditorPerformanceSettings>();
+	if (!TestNotNull(TEXT("EditorPerformanceSettings"), Settings))
+	{
+		return false;
+	}
+
+	auto ReadBool = [](const FString& Json, const TCHAR* Field)
+	{
+		TSharedPtr<FJsonObject> Obj;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+		bool bValue = false;
+		return FJsonSerializer::Deserialize(Reader, Obj) && Obj.IsValid() && Obj->TryGetBoolField(Field, bValue) && bValue;
+	};
+	auto OverrideActive = [ReadBool]() { return ReadBool(UPerformanceService::GetBackgroundThrottling(), TEXT("delegate_override_active")); };
+	auto SetThrottling = [ReadBool](const bool bEnabled) { return ReadBool(UPerformanceService::SetBackgroundThrottling(bEnabled), TEXT("success")); };
+	auto Entries = []() { return GEditor ? GEditor->ShouldDisableCPUThrottlingDelegates.Num() : 0; };
+	auto ThrottleSetting = [Settings]() { return Settings->bThrottleCPUWhenNotForeground != 0; };
+
+	// An agent's live override cannot be put back faithfully: ending it and disabling again would record the
+	// overridden value as the "before" one and lose the user's real setting. Leave it alone and skip.
+	if (OverrideActive())
+	{
+		AddWarning(TEXT("Skipped: background throttling is disabled through PerformanceService in this session; re-enable it (set_background_throttling(True)) to run this test."));
+		return true;
+	}
+
+	// The setting is a bitfield, so no TGuardValue: snapshot it and put it back at the end.
+	const bool bSavedSetting = ThrottleSetting();
+
+	// From a known throttling-on setting, with no entry of this service's registered (no override is on).
+	const int32 Baseline = Entries();
+	Settings->bThrottleCPUWhenNotForeground = true;
+
+	// Re-enabling removes the entry (on 5-8 it stayed registered for the rest of the session).
+	TestTrue(TEXT("disabling throttling succeeds"), SetThrottling(false));
+	TestEqual(TEXT("one throttling entry while throttling is off"), Entries(), Baseline + 1);
+	TestFalse(TEXT("the setting is off while disabled"), ThrottleSetting());
+	TestTrue(TEXT("a second disable succeeds"), SetThrottling(false));
+	TestEqual(TEXT("a second disable adds no second entry"), Entries(), Baseline + 1);
+	TestTrue(TEXT("re-enabling succeeds"), SetThrottling(true));
+	TestEqual(TEXT("re-enabling removes the throttling entry"), Entries(), Baseline);
+	TestFalse(TEXT("no override after re-enabling"), OverrideActive());
+
+	// Shutdown with the override still on: entry gone, setting back to its value from before the first disable.
+	TestTrue(TEXT("disabling again succeeds"), SetThrottling(false));
+	TestEqual(TEXT("the entry is back while throttling is off"), Entries(), Baseline + 1);
+	UPerformanceService::ShutdownThrottlingHook();
+	TestEqual(TEXT("ShutdownThrottlingHook removes the throttling entry"), Entries(), Baseline);
+	TestTrue(TEXT("ShutdownThrottlingHook restores the setting from before the override (on)"), ThrottleSetting());
+	TestFalse(TEXT("no override after ShutdownThrottlingHook"), OverrideActive());
+	UPerformanceService::ShutdownThrottlingHook();
+	TestEqual(TEXT("a second ShutdownThrottlingHook removes nothing more"), Entries(), Baseline);
+	TestTrue(TEXT("and leaves the setting alone"), ThrottleSetting());
+
+	// A user who already runs unthrottled gets that back, not a forced "on".
+	Settings->bThrottleCPUWhenNotForeground = false;
+	TestTrue(TEXT("disabling from an off setting succeeds"), SetThrottling(false));
+	UPerformanceService::ShutdownThrottlingHook();
+	TestFalse(TEXT("ShutdownThrottlingHook restores an off setting as off"), ThrottleSetting());
+	TestEqual(TEXT("and removes the entry"), Entries(), Baseline);
+
+	// Put the setting back as it was (no override was on, and none is now).
+	Settings->bThrottleCPUWhenNotForeground = bSavedSetting;
 	return true;
 }
 

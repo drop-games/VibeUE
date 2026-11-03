@@ -81,6 +81,38 @@ public:
 	 */
 	TResult<FString> GetPythonInfo();
 
+	/**
+	 * Check whether Code contains a pattern that would crash or hang the editor (input(), modal
+	 * dialogs, an infinite `while True:`). Comments and string-literal contents are ignored, so a
+	 * mention of the pattern in a comment or docstring does not count. Exposed static so the guard
+	 * can be unit-tested without actually executing Python.
+	 *
+	 * @param Code       Python source to inspect
+	 * @param OutPattern  Set to the matched pattern name when true is returned
+	 * @param OutReason   Set to a human-readable reason when true is returned
+	 * @return True if an unsafe pattern was found
+	 */
+	static bool ContainsUnsafePattern(const FString& Code, FString& OutPattern, FString& OutReason);
+
+	/**
+	 * The command to hand the Python plugin so that Code always runs as code. In ExecuteFile mode the
+	 * plugin takes a command whose first ".py" is followed by whitespace or the end (or, when it starts
+	 * with a quote, by a closing quote) as a file path to run, so code that merely mentions a .py file
+	 * in a comment or string failed "Could not load Python file". Code that mentions ".py" is passed
+	 * base64-encoded (no '.' in its alphabet) to a one-line exec(compile(...)) instead, which runs it in
+	 * the same globals, under the same "<string>" name and with the same line numbers; a traceback
+	 * gains one outer frame. Any other code is returned unchanged.
+	 *
+	 * This also means a bare script path passed as code (e.g. "C:/scripts/build.py"), which the plugin
+	 * used to run as a file, is now compiled as code and fails. That is deliberate: execute_python_code
+	 * takes source, and its "code" parameter description tells callers to run a file with
+	 * runpy.run_path(...) or exec(open(...).read()).
+	 *
+	 * @param Code Python source to run
+	 * @return The command text for FPythonCommandEx::Command
+	 */
+	static FString MakeCodeCommand(const FString& Code);
+
 private:
 	/**
 	 * Convert FPythonCommandEx result to our result structure

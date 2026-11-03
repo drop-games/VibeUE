@@ -50,6 +50,9 @@ VibeUE **complements** them — it focuses on the domains and depth the engine d
   CRUD. Writes go through the editor EdGraph with PIE- and open-editor-aware refusal guards.
 - **Editor safety** — `TransactionService` wraps the editor's transaction buffer (undo / redo /
   checkpoints) so an agent can group and roll back its own edits — the engine's toolsets expose none.
+- **Verified workflows** — `WorkflowService` adds an authoritative engine/build manifest, durable
+  task journals with affected-asset provenance, asynchronous PIE scenarios (compile → input →
+  assertion → capture → guaranteed teardown), and dry-run-first resumable bulk maintenance.
 - **⚡ Performance & profiling** — VibeUE's standout: see the dedicated section below.
 - **Python-first access** — run any `unreal.*` Python in the editor and introspect the whole API.
 - **Web research** — search / fetch / geocode for in-context research and terrain workflows.
@@ -133,11 +136,13 @@ Build with the project script:
 ```
 Plugins/VibeUE/BuildAndLaunchGame.ps1                  # builds + launches the editor
 Plugins/VibeUE/BuildAndLaunchGame.ps1 -StrictRebuild   # full recompile (warnings-as-errors)
+Plugins/VibeUE/BuildAndLaunchGame.ps1 -Map /Game/Maps/MyMap   # open a specific map (issue #554)
 ```
 On Linux or macOS, use the platform-detecting shell script:
 ```bash
 Plugins/VibeUE/BuildAndLaunchGame.sh --engine /path/to/UE5
 Plugins/VibeUE/BuildAndLaunchGame.sh --engine /path/to/UE5 --strict-rebuild
+Plugins/VibeUE/BuildAndLaunchGame.sh --engine /path/to/UE5 --map /Game/Maps/MyMap
 ```
 Then **Edit → Plugins** → enable **VibeUE** and restart. Its services, tools, and skills now register
 onto the same endpoint, alongside the engine's own.
