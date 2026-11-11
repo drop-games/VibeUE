@@ -27,9 +27,17 @@ param(
     # Block until the launched editor writes its readiness signal
     # (Saved/VibeUE/Signals/editor-<pid>-true.json, written once VibeUE's toolsets are
     # registered), so agents can chain the next MCP call without watching the file
-    # themselves. Exit codes: 0 ready, 2 timed out, 3 editor exited before ready.
+    # themselves. Exit codes: 0 ready, 2 timed out, 3 editor exited before ready,
+    # 4 invalid -Map (rejected before building; see the -Map note below).
     [switch]$WaitForReady,
-    [int]$ReadyTimeoutSec = 120
+    [int]$ReadyTimeoutSec = 120,
+    # Optional explicit engine root for non-registered/source installations.
+    [string]$UnrealEnginePath = "",
+    # Map to open on launch (e.g. /Game/Maps/TrainingPool). Without this the editor opens the
+    # project's default map, which after a mid-task relaunch is usually the WRONG level — world
+    # edits then land on the default map (issue #554). The loaded map is also published in the
+    # readiness signal JSON as "currentMap" so agents can verify before editing.
+    [string]$Map = ""
 )
 
 # ============================================================================
@@ -62,6 +70,43 @@ $projectName = $uprojectFile.BaseName
 $projectRoot = $uprojectFile.DirectoryName
 
 # ============================================================================
+# Validate -Map BEFORE building (issue #554 follow-up)
+# ============================================================================
+# A mount-point path like /Game/Maps/L_Foo is what the editor expects. When this script is invoked
+# from Git Bash, MSYS path conversion rewrites a leading-slash argument into a Windows path
+# (e.g. /Game/Maps/L_Foo -> C:/Program Files/Git/Game/Maps/L_Foo), and the editor then silently
+# opens the WRONG level. Reject anything that is not a clean mount-point path (must start with '/',
+# must not contain ':' or '\') up front, so the mistake fails loudly instead of after a full build.
+if ($Map) {
+    if ($Map -notmatch '^/' -or $Map -match '[:\\]') {
+        Write-Host "ERROR: -Map '$Map' is not a valid Unreal package path." -ForegroundColor Red
+        Write-Host "       Expected a mount-point path such as /Game/Maps/L_Foo or /Engine/Maps/Foo" -ForegroundColor Red
+        Write-Host "       (starts with '/', no ':' or '\\')." -ForegroundColor Red
+        Write-Host "       Likely cause: MSYS path conversion when run from Git Bash rewrote the leading" -ForegroundColor Red
+        Write-Host "       slash into a Windows path. Prefix the command with MSYS_NO_PATHCONV=1, or run" -ForegroundColor Red
+        Write-Host "       this script from PowerShell instead." -ForegroundColor Red
+        exit 4
+    }
+}
+
+# Resolve the editor target from the C# target declaration. The .uproject file
+# name is not required to match the module/target name (for example this
+# project is ue-gas-learn but its target is GAS_LearnEditor).
+$editorTarget = $null
+$targetFiles = Get-ChildItem -Path (Join-Path $projectRoot "Source") -Filter "*Editor.Target.cs" -File -ErrorAction SilentlyContinue
+foreach ($targetFile in $targetFiles) {
+    $targetText = Get-Content -LiteralPath $targetFile.FullName -Raw
+    $targetMatch = [regex]::Match($targetText, 'class\s+([A-Za-z0-9_]+)EditorTarget\s*:\s*TargetRules')
+    if ($targetMatch.Success) {
+        $editorTarget = "{0}Editor" -f $targetMatch.Groups[1].Value
+        break
+    }
+}
+if (-not $editorTarget) {
+    $editorTarget = "${projectName}Editor"
+}
+
+# ============================================================================
 # Auto-discover Unreal Engine install from EngineAssociation in .uproject
 # ============================================================================
 $uprojectJson = Get-Content $projectPath -Raw | ConvertFrom-Json
@@ -69,16 +114,39 @@ $engineAssociation = $uprojectJson.EngineAssociation
 
 # First try: look up custom/source builds from registry (HKCU)
 $enginePath = if ($EngineRoot) { (Resolve-Path -LiteralPath $EngineRoot).Path } else { $null }
+if (-not $enginePath -and $UnrealEnginePath) {
+    $candidateEnginePath = $UnrealEnginePath.Trim().Trim('"')
+    if (Test-Path (Join-Path $candidateEnginePath "Engine\Build\BatchFiles\Build.bat")) {
+        $enginePath = $candidateEnginePath
+    } else {
+        Write-Host "ERROR: Invalid Unreal engine path: $candidateEnginePath" -ForegroundColor Red
+        exit 1
+    }
+}
 try {
     if (-not $enginePath) {
     $customBuilds = Get-ItemProperty "HKCU:\SOFTWARE\Epic Games\Unreal Engine\Builds" -ErrorAction SilentlyContinue
-    if ($customBuilds -and $customBuilds.$engineAssociation) {
+    if (-not $enginePath -and $customBuilds -and $customBuilds.$engineAssociation) {
         $enginePath = $customBuilds.$engineAssociation
     }
     }
 } catch {}
 
-# Second try: standard launcher installs (HKLM)
+# Second try: the Epic launcher's own install list, which is what the editor resolves
+# EngineAssociation from. The HKLM key below can go stale: after 5.8.4 was installed to a new
+# folder it still named the old 5.8.3 install, so the script built against the wrong engine.
+if (-not $enginePath) {
+    try {
+        $launcherDat = Join-Path $env:ProgramData "Epic\UnrealEngineLauncher\LauncherInstalled.dat"
+        $launcherInstall = (Get-Content $launcherDat -Raw | ConvertFrom-Json).InstallationList |
+            Where-Object { $_.AppName -eq "UE_$engineAssociation" } | Select-Object -First 1
+        if ($launcherInstall -and (Test-Path (Join-Path $launcherInstall.InstallLocation "Engine\Build\BatchFiles\Build.bat"))) {
+            $enginePath = $launcherInstall.InstallLocation
+        }
+    } catch {}
+}
+
+# Third try: standard launcher installs (HKLM)
 if (-not $enginePath) {
     try {
         $regPath = "HKLM:\SOFTWARE\EpicGames\Unreal Engine\$engineAssociation"
@@ -89,7 +157,7 @@ if (-not $enginePath) {
     } catch {}
 }
 
-# Third try: well-known path pattern (e.g. UE_5.7)
+# Fourth try: well-known path pattern (e.g. UE_5.7)
 if (-not $enginePath) {
     $candidates = @(
         "E:\Program Files\Epic Games\UE_$engineAssociation",
@@ -113,7 +181,7 @@ if (-not $enginePath) {
 # Last try: ask for a manual path rather than just giving up (the Epic launcher
 # doesn't always register a drive, e.g. an engine installed on a non-default drive).
 if (-not $enginePath) {
-    Write-Host "Could not auto-detect Unreal Engine '$engineAssociation' from the registry or common install paths." -ForegroundColor Yellow
+    Write-Host "Could not auto-detect Unreal Engine '$engineAssociation' from the Epic launcher, the registry or common install paths." -ForegroundColor Yellow
     # Non-interactive session (CI, agent-run builds): fail fast instead of prompting.
     if ([Console]::IsInputRedirected -or ([Environment]::GetCommandLineArgs() -match '^-NonI')) {
         Write-Host "ERROR: Non-interactive session - cannot prompt for a path. Set the engine path manually or register the install." -ForegroundColor Red
@@ -136,6 +204,30 @@ if (-not $enginePath) {
 
 $buildBat  = Join-Path $enginePath "Engine\Build\BatchFiles\Build.bat"
 $editorExe = Join-Path $enginePath "Engine\Binaries\Win64\UnrealEditor.exe"
+$buildManifestPath = Join-Path $projectRoot "Saved\VibeUE\last-build.json"
+
+function Write-BuildManifest([string]$Status, [Nullable[int]]$ExitCode, [string]$Diagnostic = "") {
+    $manifestDir = Split-Path $buildManifestPath -Parent
+    New-Item -ItemType Directory -Path $manifestDir -Force | Out-Null
+    $payload = [ordered]@{
+        schema = "vibeue.build.v1"
+        status = $Status
+        projectFile = [IO.Path]::GetFullPath($projectPath)
+        engineRoot = [IO.Path]::GetFullPath($enginePath)
+        target = $editorTarget
+        platform = "Win64"
+        configuration = $Mode
+        command = "Build.bat $editorTarget Win64 $Mode `"$projectPath`" -waitmutex"
+        completedAtIso = if ($Status -in @("succeeded", "failed", "skipped")) { [DateTime]::UtcNow.ToString("o") } else { $null }
+        exitCode = $ExitCode
+        verdict = $Status
+        logPath = Join-Path $env:LOCALAPPDATA "UnrealBuildTool\Log.txt"
+        diagnostic = $Diagnostic
+    }
+    $temp = "$buildManifestPath.tmp"
+    $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $temp -Encoding UTF8
+    Move-Item -LiteralPath $temp -Destination $buildManifestPath -Force
+}
 
 Write-Host "=== $projectName Build and Launch Script ===" -ForegroundColor Cyan
 Write-Host "Script  : $PSScriptRoot" -ForegroundColor Gray
@@ -244,8 +336,9 @@ if ($StrictRebuild -and -not $Clean) {
 # Build the project
 if (-not $SkipBuild) {
     Write-Host "Building $projectName in $Mode mode (strict: warnings-as-errors via VibeUE.Build.cs)..." -ForegroundColor Yellow
+    Write-BuildManifest "running" $null
     
-    $projectBuildArgs = @("${projectName}Editor", "Win64", $Mode, $projectPath, "-waitmutex")
+    $projectBuildArgs = @($editorTarget, "Win64", $Mode, $projectPath, "-waitmutex")
     if ($LocalBuild) {
         $projectBuildArgs += @("-NoUBA", "-NoXGE", "-NoFASTBuild", "-NoSNDBS")
         Write-Host "Local build: all remote executors disabled." -ForegroundColor Yellow
@@ -253,12 +346,14 @@ if (-not $SkipBuild) {
     & $buildBat @projectBuildArgs
     
     if ($LASTEXITCODE -ne 0) {
+        Write-BuildManifest "failed" $LASTEXITCODE "UnrealBuildTool returned a non-zero exit code."
         Write-Host "Build failed! Exit code: $LASTEXITCODE" -ForegroundColor Red
         exit 1
     }
-    
+    Write-BuildManifest "succeeded" 0
     Write-Host "Build completed successfully!" -ForegroundColor Green
 } else {
+    Write-BuildManifest "skipped" $null "Build was skipped by caller; this is not compile verification."
     Write-Host "Skipping build..." -ForegroundColor Yellow
 }
 
@@ -319,6 +414,10 @@ if ($LocalBuild) {
     New-Item -ItemType Directory -Path $shaderWorkingDir -Force | Out-Null
     $editorArgs += " -NoUbaController -ShaderWorkingDir=`"$shaderWorkingDir`""
 }
+if ($Map) {
+    $editorArgs += " `"$Map`""
+    Write-Host "Opening map: $Map" -ForegroundColor Yellow
+}
 $editorProcess = Start-Process -FilePath $editorExe -ArgumentList $editorArgs -PassThru
 
 # Windows recycles process IDs, so an Editor that crashed without running OnPreExit can leave a signal
@@ -353,6 +452,42 @@ if ($WaitForReady) {
         $waited++
     }
     Write-Host "Editor is ready (signaled after ${waited}s)." -ForegroundColor Green
+
+    # Verify the editor actually opened the requested map. The readiness signal publishes the loaded
+    # level as "currentMap"; if it differs from -Map, world edits would land on the wrong level.
+    # The signal ("toolsets registered") can be published BEFORE the -Map level finishes loading, and
+    # at that instant currentMap is the transient /Temp/Untitled_N world (or empty). Treat that as
+    # "not loaded yet" and re-read the signal for up to ~20s waiting for a real level; only warn when
+    # a genuine /Game (or other mount-point) level is loaded that differs from -Map.
+    if ($Map) {
+        # Read currentMap, collapsing a full object path (/Game/Maps/L_Foo.L_Foo) to its package part.
+        function Get-CurrentMapPkg {
+            try {
+                $j = Get-Content -LiteralPath $readySignal -Raw -ErrorAction Stop | ConvertFrom-Json
+                if ($j.currentMap) { return ($j.currentMap -split '\.')[0] }
+            } catch { }
+            return ""
+        }
+
+        $currentMapPkg = Get-CurrentMapPkg
+        $mapWaited = 0
+        while (($currentMapPkg -eq "" -or $currentMapPkg -like "/Temp/*") -and $mapWaited -lt 20) {
+            Start-Sleep 1
+            $mapWaited++
+            $currentMapPkg = Get-CurrentMapPkg
+        }
+
+        if ($currentMapPkg -eq "" -or $currentMapPkg -like "/Temp/*") {
+            # Still transient after the grace window: the level is loading in the background. Not an
+            # error -- just cannot confirm it here.
+            Write-Host "NOTE: level still loading at signal time (currentMap '$currentMapPkg'); verify currentMap before world edits." -ForegroundColor Gray
+        }
+        elseif ($currentMapPkg -ne $Map) {
+            # A real level is loaded and it is not the one requested (-ne is case-insensitive).
+            Write-Host "WARNING: requested -Map '$Map' but the editor reports currentMap '$currentMapPkg'." -ForegroundColor Yellow
+            Write-Host "         The wrong level may be open; verify before making world edits." -ForegroundColor Yellow
+        }
+    }
 }
 
 Write-Host "=== Launch Complete ===" -ForegroundColor Green

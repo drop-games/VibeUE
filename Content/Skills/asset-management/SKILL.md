@@ -1,7 +1,8 @@
 ---
 name: asset-management
 display_name: Asset Discovery & Management
-description: Import/export textures crash-safely, query the Content Browser selection, and check if an asset is open (AssetDiscoveryService). Search, load, save, move, rename, duplicate, and delete assets are handled by Unreal's native AssetTools toolset or EditorAssetLibrary. Use when the user asks to import an image from disk, export a texture, query the Content Browser selection, or check whether an asset is open in an editor.
+description: Import files from disk (images, meshes, any format the editor imports), export textures, query the Content Browser selection, and check if an asset is open (AssetDiscoveryService). Search, load, save, move, rename, duplicate, and delete assets are handled by Unreal's native AssetTools toolset or EditorAssetLibrary. Use when the user asks to import an image, mesh or other file from disk, export a texture, query the Content Browser selection, or check whether an asset is open in an editor.
+  Also use for static-mesh LOD reimport, section material mapping, or gray/default surfaces after reimport.
 vibeue_classes:
   - AssetDiscoveryService
 unreal_classes:
@@ -13,6 +14,11 @@ unreal_classes:
 
 # Asset Discovery & Management Skill
 
+For static-mesh LOD reimport, lost textures or gray/default surfaces despite a
+correct component material, read [mesh reimport material mappings](references/mesh-reimport-materials.md).
+The bundled `scripts/mesh_material_slots.py` exposes explicit section inspection
+and remapping through the existing engine Python API; no native service rebuild.
+
 > 🔀 **Engine owns general asset ops now.** In the Unreal 5.8 consolidation, searching, loading,
 > saving, moving, renaming, duplicating, and deleting assets moved to Unreal's native **`AssetTools`**
 > toolset (reach it via `call_tool`; run `describe_toolset` for its actions) — or you can drive
@@ -22,8 +28,8 @@ unreal_classes:
 >
 > | Kept on `AssetDiscoveryService` | Purpose |
 > |---|---|
-> | `import_asset(src, dest_folder, name)` → `(path, err)` | Crash-safe image import (folder + name) |
-> | `import_texture(src, dest_asset_path)` | Crash-safe image import (full asset path) |
+> | `import_asset(src, dest_folder, name)` → `(path, err)` | Import an image, mesh or any importable file (folder + name) |
+> | `import_texture(src, dest_asset_path)` | Same importer, full asset path |
 > | `export_texture(asset_path, file_path)` | Export a texture to disk |
 > | `get_primary_content_browser_selection()` → `AssetData or None` | Primary Content Browser selection |
 > | `is_asset_open(asset_path)` → `bool` | Whether an asset is open in an editor |
@@ -63,6 +69,91 @@ names = unreal.DataTableFunctionLibrary.get_data_table_row_names(dt)   # row key
 
 ## Critical Rules
 
+### ⚠️ `delete_asset` on a REFERENCED asset opens a modal dialog that wedges an unattended editor
+
+`EditorAssetLibrary.delete_asset` asks "this asset is referenced, force delete?" through a modal
+window when anything points at the asset (a data asset holding the montage you are replacing, a
+Blueprint default, a level). Nobody answers it from MCP: the game thread stalls (308 s observed),
+every later call hangs, and the process has to be force-killed with the files removed from disk.
+Use the plugin's dialog-free delete instead:
+
+```python
+# Refuses when referenced and tells you who:
+result = unreal.AssetDiscoveryService.delete_asset_unattended("/Game/Anim/AM_Old", False)
+# Delete anyway and null every reference (what the dialog's Force Delete does):
+result = unreal.AssetDiscoveryService.delete_asset_unattended("/Game/Anim/AM_Old", True)
+if not result.b_success:
+    print(result.error_message)     # why it did not happen
+    print(result.referencers)       # what pointed at the asset
+```
+
+The call returns an `FUnattendedDeleteResult` struct — `result.b_success`, `result.referencers`,
+`result.error_message` — so the reason ALWAYS survives, even on a refusal. (It used to return a
+bool with out-params, and Python maps a `False` return to `None`, which silently dropped the reason;
+that is fixed.) `result.referencers` is filled on a refusal AND on a forced delete, so you always see
+what pointed at the asset. Prefer creating the replacement under a NEW name and repointing references
+over force-deleting.
+
+**Even `delete_asset_unattended(path, True)` refuses a natively rooted in-memory object — it never
+prompts.** Before deleting, the call does a conservative, non-mutating check: it looks at who holds the
+asset and refuses ONLY when a native GC root holds it directly — a `UGCObjectReferencer`, which in an
+agent session is a Python module-level global that created or loaded the asset earlier this session.
+That is the one case the engine's own force delete cannot clear, so it would stall on the modal "is in
+use" dialog (6+ minutes observed). When it refuses, the call returns `b_success == False` with those
+roots in `result.referencers` and an `result.error_message` explaining it. The fix is what the error
+says: release the Python globals holding it — `del my_var`, then `unreal.SystemLibrary.collect_garbage()`
+— and retry. Every OTHER in-memory referencer is left to the engine's real force delete, which clears it
+without prompting: on-disk asset references, the Blueprint-palette node spawners, and transient editor
+helpers like an anim data controller all delete fine. Read-only package files are also refused before
+the engine delete path, because Unreal can show a read-only-package prompt even when confirmation is
+disabled. Clear the filesystem/source-control read-only state explicitly, then retry.
+
+**Never delete inside an open transaction.** While a `unreal.ScopedEditorTransaction` block (or any
+editor transaction) is still open, every `delete_asset_unattended` call is refused with
+`result.error_code == "TRANSACTION_OPEN"` and nothing is touched: the engine's delete can reset the undo
+buffer, and a reset with a transaction open cancels that transaction. Leave the `with` block, then delete.
+
+**An asset held by the undo buffer still deletes, but it costs the undo history.** When undo is the
+asset's only holder (it was edited in a committed transaction), the engine's delete resets the undo
+history and removes the asset completely; it always did. The call logs a Warning and reports it:
+`result.b_undo_buffer_reset` is True and `result.message` says earlier edits can no longer be undone.
+`True` (force) does not change this; it only governs referencers.
+
+**Check the file, not just `b_success`.** If undo AND something else still hold the package, the engine
+drops the asset from the registry but keeps its `.uasset` on disk (it would come back on the next editor
+start). The call then fails with `error_code == "FILE_NOT_REMOVED"` and `file_status == "still_on_disk"`;
+delete the file with the editor closed. On success, `result.b_file_removed` / `result.file_status` say
+what happened to the file: `removed`, or `never_on_disk` for an asset that was never saved.
+
+The check never mutates state (it does not null any references before deciding), so a refusal leaves the
+asset and everything around it exactly as they were — safe to retry after releasing the global.
+
+### ⚠️ Never `delete_asset` a Blueprint you loaded or compiled this session
+
+`EditorAssetLibrary.delete_asset` on a Blueprint (Anim Blueprints especially) that is still loaded —
+which it is, if you created, compiled or read it earlier in the same script — fails inside
+`ForceDeleteObjects` and leaves the package **half-deleted and corrupt**:
+
+```
+Ensure condition failed: false [ObjectTools.cpp:4045]
+Failed to unload all packages during ForceDeleteObjects - these packages are likely corrupt.
+Consider restarting the editor, noting which assets remain and then deleting them from the
+file system manually: /Game/Path/ABP_Thing
+```
+
+Every later call against that path then times out, and the editor typically has to be killed. The
+recovery is exactly what the message says — close the editor, delete the `.uasset` from disk,
+relaunch (watch for a ZenServer stall on the way back up) — so it costs several minutes.
+
+**The rebuild-an-asset pattern**, instead of delete-then-create:
+
+- Write to a **new name** and swap references, or
+- Delete the file on disk while the editor is closed, then create it fresh, or
+- Edit the existing asset in place (clear the graph, re-add nodes) rather than recreating it.
+
+The same caution applies to any asset currently open in an editor tab or referenced by a loaded
+level. Non-Blueprint assets you never loaded (textures, meshes written by a factory) delete fine.
+
 ### ⚠️ Out-Params Become Return Values in Python — Never Pass an `AssetData` Argument
 
 `get_primary_content_browser_selection` is shaped like `bool Func(FAssetData& Out)` in C++ and is
@@ -85,11 +176,11 @@ if asset:
 |-----------|-----|
 | Search / find / list assets | engine **`AssetTools`** toolset via `call_tool`, or `unreal.AssetRegistryHelpers.get_asset_registry()` |
 | Load / save / save-all | `unreal.EditorAssetLibrary.load_asset` / `save_asset` / `save_directory`, or `AssetTools` |
-| Move / rename / duplicate / delete | `unreal.EditorAssetLibrary.rename_asset` (move), `duplicate_asset`, `delete_asset`, or `AssetTools` |
+| Move / rename / duplicate / delete | `unreal.EditorAssetLibrary.rename_asset` (move), `duplicate_asset`, `delete_asset` (unreferenced only — see the modal warning above), or `AssetTools`; `unreal.AssetDiscoveryService.delete_asset_unattended` for anything that may be referenced |
 | Existence check | `unreal.EditorAssetLibrary.does_asset_exist(path)` |
 | Referencers / dependencies | `unreal.AssetRegistryHelpers.get_asset_registry().get_referencers(...)` |
 | Open an asset / list ALL open editors | Epic `EditorAppToolset` via `call_tool` (see below) |
-| Import image from disk (crash-safe) | `unreal.AssetDiscoveryService.import_asset` / `import_texture` (**stay on VibeUE — see below**) |
+| Import a file from disk (image, mesh, …) | `unreal.AssetDiscoveryService.import_asset` / `import_texture` (**see below**) |
 | Export a texture to disk | `unreal.AssetDiscoveryService.export_texture` |
 | Primary Content Browser selection | `unreal.AssetDiscoveryService.get_primary_content_browser_selection()` |
 | Is an asset open in an editor | `unreal.AssetDiscoveryService.is_asset_open(path)` |
@@ -156,27 +247,48 @@ via `unreal.AssetRegistryHelpers.get_asset_registry().get_assets(...)`.
 `AssetData` has **no** `object_path` attribute (`AttributeError`). Build it from `package_name` +
 `asset_name`, or just use `str(asset.package_name)`.
 
-### ⚠️ Importing Image Files From Disk — Stay on `AssetDiscoveryService`
+### ⚠️ Importing Files From Disk — Use `AssetDiscoveryService.import_asset`
 
-To bring an image file from disk into the Content Browser, use **`AssetDiscoveryService.import_asset`**
-(or `import_texture`). Do **NOT** call `unreal.AssetToolsHelpers...import_asset_tasks` or
-`ImportAssets` from `execute_python_code` — those pump the game-thread task graph and trip a
-`RecursionGuard` assertion that **crashes the editor** when run from inside a tool call.
-`AssetDiscoveryService` uses the texture factory's direct binary path, which is safe.
+To bring a file from disk into the Content Browser, use **`AssetDiscoveryService.import_asset`**
+(or `import_texture`, which takes a full asset path and runs the same importer). It takes any
+format the editor imports, and saves what it imports:
+
+- **Images** (png, jpg, jpeg, bmp, tga, dds, exr, hdr, tiff, tif, psd, pcx) go through the
+  texture factory's direct binary path and become a `Texture2D`.
+- **Everything else** (FBX, OBJ, glTF/GLB, audio, …) goes through an automated, synchronous
+  `AssetImportTask` — no option dialogs.
 
 ```python
 import unreal
 
-# Crash-safe import (disk → Content Browser). Returns (asset_path, error); path is "" on failure.
+# Disk → Content Browser. Returns (asset_path, error); path is "" on failure.
 path, err = unreal.AssetDiscoveryService.import_asset(
     "C:/Images/rocks.jpg", "/Game/UI/Textures", "T_Rocks")
 print(path or err)
 
-# WRONG — crashes the editor (TaskGraph RecursionGuard assertion)
-# tasks = [unreal.AssetImportTask()]; unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks(tasks)
+# A mesh takes the same call. Give a file that brings materials/textures a folder of its own.
+path, err = unreal.AssetDiscoveryService.import_asset(
+    "C:/Art/crate.fbx", "/Game/Props/Crate", "SM_Crate")
+print(path or err)
 ```
 
-Supported image formats: png, jpg, jpeg, bmp, tga, dds, exr, hdr, tiff, tif, psd, pcx.
+What to expect:
+
+- **Same-name assets are replaced, without a prompt.** That includes the side assets a
+  multi-asset file brings along: an FBX's materials and textures (and a skeletal mesh's Skeleton
+  and PhysicsAsset) overwrite any asset of the same name already in the destination folder. Their
+  names are only known once the importer has run, so there is no pre-check — import such files
+  into an empty or dedicated folder.
+- **The returned path is the main asset.** For a file that brings several assets it is the mesh,
+  not a material or texture; when the importer did not use the name you passed, the path carries
+  the importer's name. List the folder (Asset Registry) to find the side assets.
+- **The one context where an import would crash, and is refused instead.** A synchronous AssetTools
+  import waits by pumping the game thread's task queue. If the caller is itself running *inside* a
+  game-thread task (the queue is already being processed), TaskGraph's `RecursionGuard` asserts and
+  the editor goes down. `import_asset` checks for exactly that and returns an error naming
+  `RecursionGuard` instead. `execute_python_code` and MCP tool calls do not run inside such a task,
+  so imports from them go ahead. Calling `unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks(...)`
+  yourself skips that check (and the save, and the main-asset pick) — prefer `import_asset`.
 
 Need a source image to import? Editor screenshots live under the **project's**
 `Saved/Screenshots` (and `Saved/VibeUE/Screenshots`):
@@ -319,7 +431,17 @@ else:
 > fails. After deleting level assets, verify the `Content/...` folder on disk and remove leftover
 > `.umap` files manually.
 
-### Import / Export Textures (VibeUE — crash-safe)
+> ⚠️ **`delete_asset` false success is not limited to levels (issue #557).** Blueprints with live
+> references have also returned `True` while their files stayed on disk — and later touching such
+> half-deleted assets ("files gone, editor memory ghosts") has crashed the editor. After ANY
+> scripted delete, verify with a filesystem check (`os.path.exists` on the `.uasset`) or
+> `does_asset_exist`, and never read properties (e.g. mesh bounds) off an asset you just deleted.
+
+> ℹ️ **`CaptureAssetImage` cannot render Blueprints or Niagara systems** ("Asset type does not
+> support image capture"). To preview those, spawn them in the level on a clear spot, aim the
+> viewport camera, and use the `capture_image` MCP tool; delete the preview actors after.
+
+### Import / Export Textures (VibeUE)
 
 ```python
 import unreal
@@ -330,7 +452,7 @@ path, err = unreal.AssetDiscoveryService.import_asset(
     "C:/Textures/logo.png", "/Game/Textures", "T_Logo")
 print(path or err)
 
-# import_texture(src, dest_asset_path) takes a full asset path and uses the same crash-safe importer:
+# import_texture(src, dest_asset_path) takes a full asset path and uses the same importer:
 unreal.AssetDiscoveryService.import_texture("C:/Textures/logo.png", "/Game/Textures/T_Logo")
 
 # Export (project → file system)
@@ -375,7 +497,7 @@ if asset and str(asset.asset_class_path.asset_name) == "Blueprint":
 ### Create Non-Standard Asset Types (Factory Pattern)
 
 Assets not covered by a VibeUE service (e.g., `LandscapeGrassType`) require `AssetToolsHelpers` + a
-factory. (The `create_asset` factory path is safe — only the import task-graph APIs crash.)
+factory. (`create_asset` imports nothing, so the import caveats above do not apply to it.)
 
 ```python
 import unreal
@@ -406,3 +528,14 @@ result's `asset_class_path.asset_name` to learn the real class name.
 ## Sample scripts (run via `execute_python_code`)
 
 - **`scripts/find_and_save.txt`** — find an asset (Asset Registry / `EditorAssetLibrary`) and duplicate + save it.
+
+## Additional gotchas
+
+- `unreal.Rotator(...)` positional order is `(roll, pitch, yaw)` — pass by keyword.
+- `unreal.AssetTools.create_asset(...)` is a descriptor and throws; the working call is `AssetToolsHelpers.get_asset_tools().create_asset(...)`.
+- `EditDefaultsOnly` properties cannot be written on instances from Python; a server-only `UPROPERTY()` with no Blueprint flag reads as "protected"; and when a bool `bIsDead` and a `UFUNCTION IsDead()` both map to `is_dead`, the property wins.
+- `TInstancedStruct` authoring: `inst = unreal.InstancedStruct(); inst.import_text('/Script/<Module>.<Struct>(Field=...)')`; a `TSoftClassPtr` UPROPERTY wants the loaded class, not a `SoftClassPath`.
+- `LevelEditorPlaySettings` is not in the Python stub — reach it via `load_class(None, "/Script/UnrealEd.LevelEditorPlaySettings")` and exact CamelCase property names.
+- Editor-world traces need a real world: `line_trace_single(actor.get_world(), ...)` (`LevelEditorSubsystem.get_world()` is a null context); `HitResult.component`/`actor` are read-protected, so read `export_text()`.
+- World subsystems have no Python accessor — reach one via `ObjectIterator(unreal.YourSubsystem)` filtered on `get_outer().get_path_name()`.
+- Never `save_dirty_packages(True, True)` — save by explicit path; a dirty package you did not touch is the user's work.

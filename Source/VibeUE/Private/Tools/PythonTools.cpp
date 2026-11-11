@@ -6,6 +6,13 @@
 #include "Json.h"
 #include "JsonUtilities.h"
 #include "Core/ErrorCodes.h"
+#include "Utils/VibeUEPythonResultLog.h" // signal-file path for the result JSON (B2 recovery)
+#include "HAL/PlatformProcess.h"
+#include "UObject/Package.h"
+#include "UObject/UObjectIterator.h" // TObjectIterator<UWorld> for the resident-map check
+#include "Engine/World.h"
+#include "Engine/Level.h"          // ULevel::OwningWorld, for the sublevel filter in GetResidentMaps
+#include "Engine/LevelStreaming.h" // ULevelStreaming::GetLoadedLevel
 #include "FileHelpers.h" // FEditorFileUtils + UEditorLoadingAndSavingUtils (headless SavePackages)
 
 // Include service headers after PythonTypes
@@ -16,7 +23,168 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogPythonTools, Log, All);
 
+TArray<FString> UPythonTools::GetResidentMapWorlds()
+{
+	// A map opened as an ASSET (unreal.load_asset("/Game/Maps/Foo"), EditorAssetLibrary.load_asset,
+	// find_object, ...) stays resident afterwards, and a resident map that is not the one currently
+	// open makes the engine's own "old level package cleaned up?" check fail the NEXT time any level
+	// is loaded. That check is a fatal, not a warning:
+	//
+	//   EditorServer.cpp:2544  World Memory Leaks: N leaks objects and packages
+	//   LogEditorServer: Error: Old level package /Game/Maps/Foo not cleaned up by garbage collection
+	//
+	// The crash therefore lands minutes later, on whoever calls load_level next, with nothing in the
+	// message pointing at the script that actually caused it. Listing the stragglers in the reply of
+	// the run that created them turns that into an immediate, attributable warning.
+	TArray<FString> Resident;
+
+	if (!GEditor)
+	{
+		return Resident;
+	}
+
+	const UWorld* EditorWorld = GEditor->GetEditorWorldContext().World();
+
+	for (TObjectIterator<UWorld> It; It; ++It)
+	{
+		UWorld* World = *It;
+		if (!World || World == EditorWorld || !IsValid(World))
+		{
+			continue;
+		}
+
+		// Only worlds that came from a real map package can block a level load. This drops the
+		// transient preview worlds the editor legitimately keeps alive in numbers (Blueprint,
+		// material and thumbnail previews all live in the transient package), and PIE worlds, whose
+		// lifetime EndPlayMap owns.
+		const UPackage* Package = World->GetPackage();
+		if (!Package || Package == GetTransientPackage())
+		{
+			continue;
+		}
+		if (World->WorldType != EWorldType::Editor && World->WorldType != EWorldType::Inactive)
+		{
+			continue;
+		}
+		if (!FPackageName::IsValidLongPackageName(Package->GetName()))
+		{
+			continue;
+		}
+
+		Resident.AddUnique(World->GetPathName());
+	}
+
+	return Resident;
+}
+
+TArray<FString> UPythonTools::GetResidentMaps()
+{
+	// Narrower than the resident_maps reply field (which keeps GetResidentMapWorlds' rule unchanged):
+	// a legacy streaming sublevel of the open map is a separate map package that is resident by design,
+	// and the level change unloads it with its persistent world. Reporting it here would make
+	// vibeue.safe_load_level refuse forever on any map that has sublevels.
+	TArray<FString> Resident = GetResidentMapWorlds();
+	const UWorld* EditorWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!EditorWorld || Resident.Num() == 0)
+	{
+		return Resident;
+	}
+
+	TSet<FString> Sublevels;
+	for (const ULevelStreaming* Streaming : EditorWorld->GetStreamingLevels())
+	{
+		const ULevel* Loaded = Streaming ? Streaming->GetLoadedLevel() : nullptr;
+		const UWorld* SublevelWorld = Loaded ? Loaded->GetTypedOuter<UWorld>() : nullptr;
+		if (SublevelWorld && SublevelWorld != EditorWorld)
+		{
+			Sublevels.Add(SublevelWorld->GetPathName());
+		}
+	}
+	for (TObjectIterator<UWorld> It; It; ++It)
+	{
+		const UWorld* World = *It;
+		if (World && World != EditorWorld && World->PersistentLevel && World->PersistentLevel->OwningWorld == EditorWorld)
+		{
+			Sublevels.Add(World->GetPathName());
+		}
+	}
+	Resident.RemoveAll([&Sublevels](const FString& Path) { return Sublevels.Contains(Path); });
+	return Resident;
+}
+
+TArray<FString> UPythonTools::GetDirtyPackages(bool bIncludeMaps)
+{
+	TArray<FString> Names;
+	if (!GEditor)
+	{
+		return Names;
+	}
+
+	// The same enumeration as the pre-run auto-save sweep, so this is exactly what an auto_save=true
+	// call would write.
+	TArray<UPackage*> DirtyPackages;
+	FEditorFileUtils::GetDirtyContentPackages(DirtyPackages);
+	if (bIncludeMaps)
+	{
+		FEditorFileUtils::GetDirtyWorldPackages(DirtyPackages);
+	}
+
+	// A TSet, not AddUnique: a World Partition map can have thousands of dirty external-actor packages,
+	// and this runs twice per execute_python_code call.
+	TSet<FString> Unique;
+	Unique.Reserve(DirtyPackages.Num());
+	for (const UPackage* DirtyPackage : DirtyPackages)
+	{
+		if (DirtyPackage)
+		{
+			Unique.Add(DirtyPackage->GetName());
+		}
+	}
+	Names = Unique.Array();
+	Names.Sort();
+	return Names;
+}
+
+void UPythonTools::ComputeDirtyPackageDelta(const TArray<FString>& Before, const TArray<FString>& After,
+	TArray<FString>& OutDirtied, TArray<FString>& OutCleaned)
+{
+	OutDirtied.Reset();
+	OutCleaned.Reset();
+
+	const TSet<FString> BeforeSet(Before);
+	const TSet<FString> AfterSet(After);
+	for (const FString& Name : AfterSet)
+	{
+		if (!BeforeSet.Contains(Name))
+		{
+			OutDirtied.Add(Name);
+		}
+	}
+	for (const FString& Name : BeforeSet)
+	{
+		if (!AfterSet.Contains(Name))
+		{
+			OutCleaned.Add(Name);
+		}
+	}
+	OutDirtied.Sort();
+	OutCleaned.Sort();
+}
+
 using namespace VibeUE;
+
+// Write a string list as a JSON array field (an empty list still writes the key: reply fields are
+// always present, so a caller can index them without a presence check).
+static void SetStringArrayField(const TSharedPtr<FJsonObject>& Obj, const TCHAR* FieldName, const TArray<FString>& Values)
+{
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	Arr.Reserve(Values.Num());
+	for (const FString& Value : Values)
+	{
+		Arr.Add(MakeShared<FJsonValueString>(Value));
+	}
+	Obj->SetArrayField(FieldName, Arr);
+}
 
 // Track whether the last Python execution crashed (SEH-caught).
 // When true, skip auto-save to avoid serializing potentially corrupt assets.
@@ -149,7 +317,7 @@ void UPythonTools::Shutdown()
 	UE_LOG(LogPythonTools, Log, TEXT("UPythonTools::Shutdown - All service instances released"));
 }
 
-FString UPythonTools::ExecutePythonCode(const FString& Code)
+FString UPythonTools::ExecutePythonCode(const FString& Code, bool bAutoSave)
 {
 	// Efficient engine readiness check - once ready, never check again
 	static bool bEngineReady = false;
@@ -174,6 +342,9 @@ FString UPythonTools::ExecutePythonCode(const FString& Code)
 			ErrorObj->SetStringField(TEXT("error_message"), FString::Printf(
 				TEXT("Blocked world-mutating Python execution: %s Retry in a few seconds after the level finishes loading."),
 				*BlockReason));
+			// Nothing ran, so nothing was dirtied or cleaned; the keys are still present.
+			SetStringArrayField(ErrorObj, TEXT("dirtied_packages"), TArray<FString>());
+			SetStringArrayField(ErrorObj, TEXT("cleaned_packages"), TArray<FString>());
 			FString JsonString;
 			TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonString);
 			FJsonSerializer::Serialize(ErrorObj.ToSharedRef(), Writer);
@@ -181,19 +352,44 @@ FString UPythonTools::ExecutePythonCode(const FString& Code)
 		}
 	}
 
-	// Auto-save all dirty packages (headless) before executing Python code, unless the previous
-	// run crashed (dirty assets may be corrupt), GEditor is missing, or we're in PIE.
+	// Names of the packages written by the pre-execution auto-save sweep. Reported in the result JSON
+	// (saved_packages) so an agent can see, and pass on, exactly what was flushed to disk before the
+	// script ran. Empty when auto_save is false, when the sweep is skipped, or when nothing was dirty.
+	TArray<FString> SavedPackageNames;
+
+	// Whether the sweep actually ran, and why not when it did not. Reported verbatim in the result
+	// JSON: the caller already knows what it PASSED as auto_save, so echoing the argument back tells
+	// it nothing — what it cannot otherwise tell is whether its unsaved editor edits reached disk.
+	bool bAutoSaveRan = false;
+	FString AutoSaveNote;
+
+	// Auto-save all dirty packages (headless) before executing Python code, unless the caller opted
+	// out (auto_save=false), the previous run crashed (dirty assets may be corrupt), GEditor is
+	// missing, or we're in PIE.
+	if (!bAutoSave)
+	{
+		AutoSaveNote = TEXT("opted_out");
+		UE_LOG(LogPythonTools, Verbose, TEXT("Auto-save skipped: auto_save=false — running the script without flushing dirty packages"));
+	}
+	else
 	{
 		if (bLastPythonExecutionCrashed)
 		{
+			AutoSaveNote = TEXT("previous_run_crashed");
 			UE_LOG(LogPythonTools, Warning, TEXT("Skipping auto-save: previous Python execution crashed — dirty assets may be corrupt"));
 		}
 		else if (!GEditor)
 		{
+			AutoSaveNote = TEXT("editor_unavailable");
 			UE_LOG(LogPythonTools, Warning, TEXT("Cannot auto-save: GEditor is not available"));
 		}
-		else if (GIsPlayInEditorWorld)
+		// GIsPlayInEditorWorld alone is not enough: the engine sets it only while the PIE world itself
+		// ticks (SetPlayInEditorWorld/RestoreEditorWorld), so a call dispatched from editor scope during
+		// a PIE or Simulate session sees it false. GEditor->PlayWorld is non-null for the whole session.
+		// Same test as the engine's EditorScriptingHelpers::CheckIfInEditorAndPIE.
+		else if (GEditor->PlayWorld || GIsPlayInEditorWorld)
 		{
+			AutoSaveNote = TEXT("pie_active");
 			UE_LOG(LogPythonTools, Warning, TEXT("Cannot auto-save: Currently in PIE mode"));
 		}
 		else
@@ -210,12 +406,25 @@ FString UPythonTools::ExecutePythonCode(const FString& Code)
 			FEditorFileUtils::GetDirtyContentPackages(DirtyPackages);
 			FEditorFileUtils::GetDirtyWorldPackages(DirtyPackages);
 
+			// The sweep reached the point of inspecting the editor's dirty set — that is what
+			// "it ran" means, whether or not anything was dirty.
+			bAutoSaveRan = true;
+
 			if (DirtyPackages.Num() == 0)
 			{
 				UE_LOG(LogPythonTools, Verbose, TEXT("Auto-save: no dirty packages"));
 			}
 			else
 			{
+				// Record the names before the save so the report reflects what the sweep targeted.
+				for (const UPackage* DirtyPackage : DirtyPackages)
+				{
+					if (DirtyPackage)
+					{
+						SavedPackageNames.Add(DirtyPackage->GetName());
+					}
+				}
+
 				const bool bSaveSuccess = UEditorLoadingAndSavingUtils::SavePackages(DirtyPackages, /*bOnlyDirty=*/true);
 				if (bSaveSuccess)
 				{
@@ -223,11 +432,39 @@ FString UPythonTools::ExecutePythonCode(const FString& Code)
 				}
 				else
 				{
+					// Some or all of the targeted packages did not reach disk. Say so rather than
+					// letting SavedPackages imply a clean flush.
+					bAutoSaveRan = false;
+					AutoSaveNote = TEXT("save_failed");
 					UE_LOG(LogPythonTools, Warning, TEXT("Auto-save (headless) completed with warnings or errors"));
 				}
 			}
 		}
 	}
+
+	// Attach the auto-save report to any JSON result object returned below, so every reply (success
+	// or error) carries auto_save + saved_packages.
+	auto AddSaveInfo = [&bAutoSaveRan, &AutoSaveNote, &SavedPackageNames](const TSharedPtr<FJsonObject>& Obj)
+	{
+		Obj->SetBoolField(TEXT("auto_save"), bAutoSaveRan);
+		Obj->SetStringField(TEXT("auto_save_note"), AutoSaveNote);
+		TArray<TSharedPtr<FJsonValue>> SavedArray;
+		for (const FString& Name : SavedPackageNames)
+		{
+			SavedArray.Add(MakeShared<FJsonValueString>(Name));
+		}
+		Obj->SetArrayField(TEXT("saved_packages"), SavedArray);
+	};
+
+	// What the script itself dirtied and cleaned (filled once it has run). Attached to every JSON
+	// reply below, empty when the script never ran, so callers can rely on both keys.
+	TArray<FString> DirtiedPackageNames;
+	TArray<FString> CleanedPackageNames;
+	auto AddDirtyInfo = [&DirtiedPackageNames, &CleanedPackageNames](const TSharedPtr<FJsonObject>& Obj)
+	{
+		SetStringArrayField(Obj, TEXT("dirtied_packages"), DirtiedPackageNames);
+		SetStringArrayField(Obj, TEXT("cleaned_packages"), CleanedPackageNames);
+	};
 
 	auto Service = GetExecutionService();
 	if (!Service.IsValid() || !Service.Get())
@@ -236,6 +473,8 @@ FString UPythonTools::ExecutePythonCode(const FString& Code)
 		ErrorObj->SetBoolField(TEXT("success"), false);
 		ErrorObj->SetStringField(TEXT("error_code"), TEXT("PYTHON_SERVICE_UNAVAILABLE"));
 		ErrorObj->SetStringField(TEXT("error_message"), TEXT("Python execution service is not available"));
+		AddSaveInfo(ErrorObj);
+		AddDirtyInfo(ErrorObj);
 		FString JsonString;
 		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonString);
 		FJsonSerializer::Serialize(ErrorObj.ToSharedRef(), Writer);
@@ -249,18 +488,62 @@ FString UPythonTools::ExecutePythonCode(const FString& Code)
 		ErrorObj->SetBoolField(TEXT("success"), false);
 		ErrorObj->SetStringField(TEXT("error_code"), TEXT("SERVICE_CONTEXT_INVALID"));
 		ErrorObj->SetStringField(TEXT("error_message"), TEXT("Service context is not properly initialized"));
+		AddSaveInfo(ErrorObj);
+		AddDirtyInfo(ErrorObj);
 		FString JsonString;
 		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonString);
 		FJsonSerializer::Serialize(ErrorObj.ToSharedRef(), Writer);
 		return JsonString;
 	}
 
+	// Snapshot the dirty set immediately around the script. The auto-save sweep above has already
+	// run, so its saves are not attributed to the script, and dirt that predates this call never shows
+	// up as "dirtied". Taken on the error path too: a script that raised half-way through an edit is
+	// exactly the one whose stray dirt a later auto_save=true call would otherwise flush to disk.
+	const TArray<FString> DirtyBeforeRun = GetDirtyPackages(/*bIncludeMaps=*/true);
+
 	auto Result = Service->ExecuteCode(Code);
+
+	// After an SEH-caught crash the editor may hold half-torn objects, and the after-snapshot walks every
+	// UPackage outside the crash guard - so skip it and report empty lists rather than risk a second crash.
+	if (!(Result.IsError() && Result.GetErrorCode() == FString(ErrorCodes::PYTHON_EDITOR_CRASH)))
+	{
+		ComputeDirtyPackageDelta(DirtyBeforeRun, GetDirtyPackages(/*bIncludeMaps=*/true), DirtiedPackageNames, CleanedPackageNames);
+	}
+
+	// Maps this run has left resident (see GetResidentMapWorlds). Computed here, BEFORE the error
+	// branch, because the run that strands a map is frequently the same run that raised - that was
+	// the shape of the crash this check exists to prevent - so the failing reply must carry it too.
+	const TArray<FString> ResidentMaps = GetResidentMapWorlds();
+	if (ResidentMaps.Num() > 0)
+	{
+		UE_LOG(LogPythonTools, Warning,
+			TEXT("RESIDENT_MAPS: %d map(s) other than the open level are loaded in memory (%s). Loading any level while they are resident ")
+			TEXT("fails the engine's stale-world check and TAKES THE EDITOR DOWN (EditorServer.cpp 'World Memory Leaks'). A map package loads ")
+			TEXT("RF_Standalone, and neither collect_garbage() nor EditorLoadingAndSavingUtils.unload_packages() releases it (both verified) - ")
+			TEXT("so RESTART THE EDITOR before the next level change, and do not open a map as an asset: read map metadata from the asset ")
+			TEXT("registry, and change level with LevelEditorSubsystem.load_level."),
+			ResidentMaps.Num(), *FString::Join(ResidentMaps, TEXT(", ")));
+	}
+
+	auto AddResidentInfo = [&ResidentMaps](const TSharedPtr<FJsonObject>& Obj)
+	{
+		TArray<TSharedPtr<FJsonValue>> Arr;
+		for (const FString& MapPath : ResidentMaps)
+		{
+			Arr.Add(MakeShared<FJsonValueString>(MapPath));
+		}
+		Obj->SetArrayField(TEXT("resident_maps"), Arr);
+	};
 
 	if (Result.IsError())
 	{
-		// Track crash state so next auto-save is skipped (corrupt assets)
-		if (Result.GetErrorCode() == FString(ErrorCodes::PYTHON_RUNTIME_ERROR))
+		// Track crash state so the next auto-save is skipped (the editor may hold half-mutated
+		// objects). ONLY a real SEH crash counts: this used to trigger on PYTHON_RUNTIME_ERROR, which
+		// is also what an ordinary Python traceback returns, so a trivial AttributeError silently
+		// disabled auto-save for the following call (issue #608). A caught exception corrupts
+		// nothing — the interpreter handled it and the editor is fine.
+		if (Result.GetErrorCode() == FString(ErrorCodes::PYTHON_EDITOR_CRASH))
 		{
 			bLastPythonExecutionCrashed = true;
 		}
@@ -269,6 +552,9 @@ FString UPythonTools::ExecutePythonCode(const FString& Code)
 		ErrorObj->SetBoolField(TEXT("success"), false);
 		ErrorObj->SetStringField(TEXT("error_code"), Result.GetErrorCode());
 		ErrorObj->SetStringField(TEXT("error_message"), Result.GetErrorMessage());
+		AddSaveInfo(ErrorObj);
+		AddResidentInfo(ErrorObj);
+		AddDirtyInfo(ErrorObj);
 		FString JsonString;
 		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonString);
 		FJsonSerializer::Serialize(ErrorObj.ToSharedRef(), Writer);
@@ -278,7 +564,15 @@ FString UPythonTools::ExecutePythonCode(const FString& Code)
 	// Successful execution — safe to auto-save again
 	bLastPythonExecutionCrashed = false;
 
-	return ConvertExecutionResultToJson(Result.GetValue());
+	// Carry the auto-save report through to the success JSON alongside the execution result.
+	FPythonExecutionResult Value = Result.GetValue();
+	Value.bAutoSave = bAutoSaveRan;
+	Value.AutoSaveNote = AutoSaveNote;
+	Value.SavedPackages = SavedPackageNames;
+	Value.ResidentMaps = ResidentMaps;
+	Value.DirtiedPackages = DirtiedPackageNames;
+	Value.CleanedPackages = CleanedPackageNames;
+	return ConvertExecutionResultToJson(Value);
 }
 
 FString UPythonTools::DiscoverPythonModule(const FString& ModuleName)
@@ -433,6 +727,9 @@ FString UPythonTools::ConvertExecutionResultToJson(const VibeUE::FPythonExecutio
 {
 	TSharedPtr<FJsonObject> JsonObj = MakeShared<FJsonObject>();
 	JsonObj->SetBoolField(TEXT("success"), Result.bSuccess);
+	// run_id lets a client correlate this reply with the persisted python-<pid>-last.json / -runs.jsonl
+	// record; on a call that timed out, recover the result with vibeue.last_python_result() (B2).
+	JsonObj->SetNumberField(TEXT("run_id"), static_cast<double>(Result.RunId));
 	JsonObj->SetStringField(TEXT("output"), Result.Output);
 	JsonObj->SetStringField(TEXT("result"), Result.Result);
 	
@@ -441,8 +738,40 @@ FString UPythonTools::ConvertExecutionResultToJson(const VibeUE::FPythonExecutio
 	{
 		JsonObj->SetStringField(TEXT("error"), Result.ErrorMessage);
 	}
-	
+
 	JsonObj->SetNumberField(TEXT("execution_time_ms"), Result.ExecutionTimeMs);
+
+	// timed_out is true when the run finished successfully but overran the client timeout; the payload
+	// is still valid. signal_file_path is where this run's outcome is persisted, so a client that gave
+	// up can recover it with vibeue.last_python_result() (B2).
+	JsonObj->SetBoolField(TEXT("timed_out"), Result.bTimedOut);
+	JsonObj->SetStringField(TEXT("signal_file_path"),
+		FVibeUEPythonResultLog::GetLastResultPathForPid(FPlatformProcess::GetCurrentProcessId()));
+
+	// Auto-save report (issue #433 follow-up): whether the pre-execution sweep ran and what it wrote.
+	// auto_save is the OUTCOME, not an echo of the argument — auto_save_note names the reason
+	// whenever it is false, so "opted out" is never confused with "ran, nothing was dirty".
+	JsonObj->SetBoolField(TEXT("auto_save"), Result.bAutoSave);
+	JsonObj->SetStringField(TEXT("auto_save_note"), Result.AutoSaveNote);
+
+	// Maps left loaded in memory besides the open level. Non-empty means the NEXT level load will
+	// fatal the editor on the engine's stale-world check, so this is a hard warning, not trivia.
+	TArray<TSharedPtr<FJsonValue>> ResidentArray;
+	for (const FString& MapPath : Result.ResidentMaps)
+	{
+		ResidentArray.Add(MakeShared<FJsonValueString>(MapPath));
+	}
+	JsonObj->SetArrayField(TEXT("resident_maps"), ResidentArray);
+	TArray<TSharedPtr<FJsonValue>> SavedArray;
+	for (const FString& Name : Result.SavedPackages)
+	{
+		SavedArray.Add(MakeShared<FJsonValueString>(Name));
+	}
+	JsonObj->SetArrayField(TEXT("saved_packages"), SavedArray);
+
+	// What the script itself dirtied and cleaned (snapshots taken after the auto-save sweep).
+	SetStringArrayField(JsonObj, TEXT("dirtied_packages"), Result.DirtiedPackages);
+	SetStringArrayField(JsonObj, TEXT("cleaned_packages"), Result.CleanedPackages);
 
 	FString JsonString;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonString);

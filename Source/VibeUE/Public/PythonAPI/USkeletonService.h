@@ -228,6 +228,14 @@ struct FLearnedConstraintsInfo
 	/** Per-bone learned rotation ranges */
 	UPROPERTY(BlueprintReadWrite, Category = "Skeleton")
 	TArray<FLearnedBoneRange> BoneRanges;
+
+	/** Canonical paths used by explicit-reference learning. */
+	UPROPERTY(BlueprintReadWrite, Category = "Skeleton")
+	TArray<FString> SourceAnimations;
+
+	/** Curated reference endpoints are retained, not statistically trimmed. */
+	UPROPERTY(BlueprintReadWrite, Category = "Skeleton")
+	bool bUseObservedLimits = false;
 };
 
 /**
@@ -1056,6 +1064,14 @@ public:
 		const FString& SkeletonPath,
 		int32 MaxAnimations,
 		int32 SamplesPerAnimation,
+		FLearnedConstraintsInfo& OutConstraints);
+
+	/** Learn from an explicit corpus on this exact skeleton. Sort/deduplicate,
+	 * reject missing/mismatched references, retain observed extrema, and update
+	 * the cache atomically. No assets are modified. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Skeleton|Profiles")
+	static bool LearnFromAnimationReferences(const FString& SkeletonPath,
+		const TArray<FString>& AnimationPaths, int32 SamplesPerAnimation,
 		FLearnedConstraintsInfo& OutConstraints);
 
 	/**

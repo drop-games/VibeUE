@@ -8,16 +8,79 @@
 #include "UAssetDiscoveryService.generated.h"
 
 /**
+ * Result of DeleteAssetUnattended.
+ *
+ * The function used to return bool with OutReferencers/OutError out-params, and Python maps a
+ * false bool return to None, which dropped the referencers AND the reason on every refusal — the
+ * exact information the caller needs to recover. A struct return always survives to Python.
+ */
+USTRUCT(BlueprintType)
+struct FUnattendedDeleteResult
+{
+	GENERATED_BODY()
+
+	/** True only when the asset is gone: out of memory and the registry, and its package file off disk if it had one. */
+	UPROPERTY(BlueprintReadWrite, Category = "Assets")
+	bool bSuccess = false;
+
+	/** Package paths / object names that referenced the asset (filled on refusal AND on a forced delete). */
+	UPROPERTY(BlueprintReadWrite, Category = "Assets")
+	TArray<FString> Referencers;
+
+	/** Human-readable reason when the delete did not happen; empty on success. */
+	UPROPERTY(BlueprintReadWrite, Category = "Assets")
+	FString ErrorMessage;
+
+	/**
+	 * Machine-readable refusal code. "TRANSACTION_OPEN": an editor transaction is still open, so nothing
+	 * was deleted. "FILE_NOT_REMOVED": the engine delete ran but the package file is still on disk. Empty on success
+	 * and on the older refusal paths (empty path, not found, read-only, referenced, native GC root),
+	 * which ErrorMessage describes.
+	 */
+	UPROPERTY(BlueprintReadWrite, Category = "Assets")
+	FString ErrorCode;
+
+	/** True when the asset's package file existed on disk before the delete and is gone after it. */
+	UPROPERTY(BlueprintReadWrite, Category = "Assets")
+	bool bFileRemoved = false;
+
+	/**
+	 * What happened to the package FILE: "removed", "never_on_disk" (an in-memory asset that was never
+	 * saved, so there was no file to remove), "still_on_disk" (bSuccess is false, ErrorCode
+	 * FILE_NOT_REMOVED), or empty when the call refused before deleting anything.
+	 */
+	UPROPERTY(BlueprintReadWrite, Category = "Assets")
+	FString FileStatus;
+
+	/**
+	 * True when the editor's undo history was reset across the engine delete call: the undo queue held at
+	 * least one transaction before ForceDeleteObjects and none after (the engine resets it whenever undo is
+	 * the asset's only holder). Earlier edits can no longer be undone. Reported on EVERY return after the
+	 * delete call, failures included (bSuccess false, e.g. FILE_NOT_REMOVED); false on refusals before it.
+	 */
+	UPROPERTY(BlueprintReadWrite, Category = "Assets")
+	bool bUndoBufferReset = false;
+
+	/**
+	 * Human-readable note, set whenever there is something to say about the undo history or the delete
+	 * outcome, on success or failure (e.g. that the undo history was reset, or that an undo-held asset's
+	 * history was NOT reset); empty otherwise. Errors themselves go in ErrorMessage.
+	 */
+	UPROPERTY(BlueprintReadWrite, Category = "Assets")
+	FString Message;
+};
+
+/**
  * Asset import/export and Content Browser service exposed directly to Python.
  *
  * Asset search and general CRUD are provided by the engine's AssetTools toolset.
- * This service owns crash-safe image import, texture export, Content Browser
- * selection, and open-editor checks.
+ * This service owns file import (images, meshes, any format the editor imports),
+ * texture export, Content Browser selection, and open-editor checks.
  *
  * Python Usage:
  *   import unreal
  *
- *   # Import an image without pumping the task graph inside an MCP call
+ *   # Import an image (a mesh or any other importable file takes the same call)
  *   path, error = unreal.AssetDiscoveryService.import_asset(
  *       "C:/Images/rocks.jpg", "/Game/UI/Textures", "T_Rocks")
  *
@@ -38,6 +101,8 @@ public:
 
 	/**
 	 * Import a texture from the file system into the project.
+	 * Same importer as ImportAsset (DestinationPath split into folder + name), so a non-image file is imported as
+	 * its own asset type rather than refused.
 	 *
 	 * @param SourceFilePath - Absolute path to the texture file (PNG, JPG, TGA, etc.)
 	 * @param DestinationPath - Asset path where texture will be created (e.g., "/Game/Textures/MyTexture")
@@ -50,30 +115,126 @@ public:
 	static bool ImportTexture(const FString& SourceFilePath, const FString& DestinationPath);
 
 	/**
-	 * Import an image file from disk into the Content Browser as a Texture2D.
+	 * Import a file from disk into the Content Browser and save it: an image as a Texture2D, a mesh (FBX, OBJ, glTF, ...)
+	 * or any other format the editor's importers take as its asset. An existing asset of the same name is replaced,
+	 * and so is any same-named asset in DestinationFolder that a multi-asset file brings along (an FBX's materials and
+	 * textures), without a prompt: import such files into a folder of their own.
 	 *
-	 * Uses the texture factory's direct binary path (FactoryCreateBinary) rather than
-	 * AssetTools::ImportAssets/ImportAssetTasks. The high-level import APIs pump the
-	 * game-thread task graph, which asserts (RecursionGuard) when invoked from inside an
-	 * MCP tool call (those run inside an AsyncTask on the game thread). This path is safe
-	 * to call from execute_python_code and from the manage_asset 'import' action.
+	 * Images use the texture factory's direct binary path (FactoryCreateBinary). Every other format goes
+	 * through AssetTools' AssetImportTask, automated and synchronous. Its wait pumps the game thread's task queue,
+	 * which asserts (RecursionGuard) only when the caller is itself a game-thread task; tool calls and
+	 * execute_python_code are not, and a call from inside such a task is refused with a message.
 	 *
-	 * Supported formats: png, jpg, jpeg, bmp, tga, dds, exr, hdr, tiff, tif, psd, pcx.
+	 * Image formats: png, jpg, jpeg, bmp, tga, dds, exr, hdr, tiff, tif, psd, pcx.
 	 *
-	 * @param SourceFilePath    - Absolute path to the image file on disk
+	 * @param SourceFilePath    - Absolute path to the file on disk
 	 * @param DestinationFolder - Content Browser folder (e.g. "/Game/UI/Textures")
 	 * @param AssetName         - Optional asset name; if empty, derived from the file name
 	 * @param OutError          - Receives a human-readable error message on failure
-	 * @return The created asset's object path (e.g. "/Game/UI/Textures/T_Foo.T_Foo"), or empty on failure
+	 * @return The created asset's object path (e.g. "/Game/UI/Textures/T_Foo.T_Foo"), or empty on failure. For a file
+	 *         that brings several assets, the main one: the mesh over its materials, textures, skeleton and physics
+	 *         asset (named AssetName when the importer used it; otherwise the importer's name is in the path)
 	 *
 	 * Example:
 	 *   path, err = unreal.AssetDiscoveryService.import_asset("C:/Images/rocks.jpg", "/Game/UI/Textures", "T_Rocks")
+	 *   path, err = unreal.AssetDiscoveryService.import_asset("C:/Art/crate.fbx", "/Game/Props", "SM_Crate")
 	 */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Assets")
 	static FString ImportAsset(
 		const FString& SourceFilePath,
 		const FString& DestinationFolder,
 		const FString& AssetName,
+		FString& OutError);
+
+	/**
+	 * Reimport an existing asset through the same handler used by Content Browser Reimport.
+	 *
+	 * Supports both Interchange and legacy factory imports. When NewSourcePath is supplied,
+	 * the registered reimport handler is asked to retarget the asset before reimporting it.
+	 * The operation is automated and never opens a missing-file picker or notification.
+	 *
+	 * @param AssetPath         - Content path or object path of the asset to reimport
+	 * @param NewSourcePath     - Optional replacement source file; empty uses the stored source
+	 * @param OutSourceFileUsed - Receives the resolved source file selected for reimport
+	 * @param OutError          - Receives a human-readable error message on failure
+	 * @return True when Unreal's registered reimport handler completed successfully
+	 *
+	 * Python usage (Unreal maps a false bool plus out parameters to None):
+	 *   result = unreal.AssetDiscoveryService.reimport_asset(
+	 *       "/Game/Characters/SKM_Player", "D:/Source/SKM_Player.fbx")
+	 *   if result is not None:
+	 *       source_file, error = result
+	 */
+	/**
+	 * Delete an asset with NO dialog, for unattended agent sessions. The engine's
+	 * EditorAssetLibrary.delete_asset pops a modal "asset is referenced" dialog when anything
+	 * points at the asset, and an MCP-driven editor cannot answer it: the game thread stalls
+	 * until someone force-kills the process. This function never asks. With
+	 * bForceEvenIfReferenced it force-deletes and nulls every reference (the same thing the
+	 * dialog's Force Delete button does); without it, a referenced asset is refused and the
+	 * referencers are returned so the caller can decide.
+	 *
+	 * IMPLEMENTATION: the refusal DECISION is a strictly NON-MUTATING, conservative native-root check.
+	 * It clears the Blueprint action database (harmless; mirrors the engine's OnAssetsPreDelete handler),
+	 * collects garbage, then runs ObjectTools::GatherObjectReferencersForDeletion with default flags to
+	 * see who holds the asset — WITHOUT replacing any references first. It refuses ONLY when an external
+	 * referencer is a UGCObjectReferencer: a native GC root holding the asset directly, which in an
+	 * unattended session is a Python module-level global that created or loaded it. That is the one case
+	 * the engine's force delete cannot clear, so it would stall on the modal "is in use" dialog. Every
+	 * other in-memory referencer — on-disk asset references, the action database's transient node
+	 * spawners, transient editor helpers like AnimSequencerController — the engine's own force delete
+	 * clears without prompting, so those are left to it.
+	 *
+	 * The decision does NOT run ForceReplaceReferences: an earlier shape did, and on a refusal it left the
+	 * Blueprint's skeleton/generated classes with a null ClassGeneratedBy, crashing the caller's retry
+	 * ("UBlueprintGeneratedClass::GetAuthoritativeClass: ClassGeneratedBy is null"). So the check only
+	 * looks; it never mutates.
+	 *
+	 * On success the ACTUAL deletion is handed to the real ObjectTools::ForceDeleteObjects(bShowConfirmation
+	 * =false), exactly as the pre-A13 code did, so child-Blueprint reparenting, child-redirector/
+	 * generated-class removal and UUserDefinedStruct reinstancing keep full engine fidelity. Its own
+	 * internal "is in use" check cannot reach a dialog, because we already confirmed no native root holds
+	 * the asset. A read-only package is also refused before ForceDeleteObjects, preventing its remaining
+	 * read-only-package prompt. The function therefore preserves its unattended/no-modal contract.
+	 *
+	 * OPEN TRANSACTION: every delete is refused with ErrorCode "TRANSACTION_OPEN" while an editor
+	 * transaction is still open (e.g. inside a unreal.ScopedEditorTransaction block). The engine delete
+	 * can reset the undo buffer, and a reset with a transaction open cancels that transaction.
+	 *
+	 * UNDO BUFFER: an asset a committed transaction still holds is deleted as the engine always did:
+	 * when undo is its only holder, the engine's delete resets the undo history (ObjectTools.cpp
+	 * DeleteSingleObject / CleanupAfterSuccessfulDelete) and the asset goes completely. A Warning is
+	 * logged. bUndoBufferReset (the undo queue went from non-empty to empty across the delete call) and
+	 * Message report what happened on every return after the delete call, success or failure, not only
+	 * on success. bForceEvenIfReferenced does not affect this.
+	 * If undo AND another holder keep the package, the engine leaves its file on disk; the FILE CHECK
+	 * reports that.
+	 *
+	 * FILE CHECK: after the engine delete the package file is looked up on disk again. bFileRemoved and
+	 * FileStatus report it; a file that is still there makes the call fail with ErrorCode
+	 * "FILE_NOT_REMOVED" (the asset would come back on the next editor start).
+	 *
+	 * @param AssetPath              - Package path of the asset (/Game/Folder/Asset)
+	 * @param bForceEvenIfReferenced - True: delete anyway and clear references; false: refuse if referenced
+	 * @return FUnattendedDeleteResult: bSuccess, Referencers (filled on refusal AND on force), ErrorMessage
+	 *
+	 * Python usage (the result struct always comes back, so the reason survives a refusal):
+	 *   result = unreal.AssetDiscoveryService.delete_asset_unattended("/Game/Anim/AS_Temp", True)
+	 *   if not result.b_success:
+	 *       print(result.error_code, result.error_message, result.referencers)
+	 *   else:
+	 *       print(result.file_status, result.b_file_removed, result.b_undo_buffer_reset, result.message)
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable, CPP_Default_bForceEvenIfReferenced = "false"), Category = "VibeUE|Assets")
+	static FUnattendedDeleteResult DeleteAssetUnattended(
+		const FString& AssetPath,
+		bool bForceEvenIfReferenced);
+
+	UFUNCTION(BlueprintCallable, meta = (AICallable, CPP_Default_NewSourcePath = ""), Category = "VibeUE|Assets")
+	static bool ReimportAsset(
+		const FString& AssetPath,
+		const FString& NewSourcePath,
+		FString& OutSourceFileUsed,
 		FString& OutError);
 
 	/**
