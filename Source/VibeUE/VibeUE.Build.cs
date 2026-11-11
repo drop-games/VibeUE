@@ -139,6 +139,7 @@ public class VibeUE : ModuleRules
 				"MetasoundGraphCore",     // For core MetaSound graph types
 				"MeshDescription",        // For FMeshDescription / TVertexInstanceAttributesRef (UV editing)
 				"StaticMeshDescription",  // For FStaticMeshAttributes / FStaticMeshOperations / FUVMapParameters
+				"AsyncFunctionResult",    // UAsyncFunctionResultString returned by UToolsetRegistry::ExecuteTool (UE 5.9)
 				"ToolsetRegistry",        // UE 5.8 native AI toolset registry — exposes services as AICallable tools on Epic's MCP endpoint
 				"ModelContextProtocol",   // UE 5.8 native MCP server — VibeUE's dynamic tools are bridged onto Epic's endpoint
 				"ModelContextProtocolEngine", // UE::ModelContextProtocol::GetServerPortNumber() — configured MCP port + -ModelContextProtocolPort= override (B6)

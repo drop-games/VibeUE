@@ -70,7 +70,7 @@ namespace
 	FString RequestKey(const FModelContextProtocolToolRequestId& RequestId)
 	{
 		// The id's own operator== and hash are not exported; its JSON text is what Epic hashes too.
-		return RequestId.RequestId.IsValid() ? RequestId.RequestId->AsString() : FString();
+		return RequestId.GetRequestId().IsValid() ? RequestId.GetRequestId()->AsString() : FString();
 	}
 
 	/** Turn a tool's JSON string into the MCP result and hand it over (safe from any thread). */
