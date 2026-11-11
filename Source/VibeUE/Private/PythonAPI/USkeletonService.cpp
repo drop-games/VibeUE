@@ -4,6 +4,9 @@
 #include "PythonAPI/UAnimSequenceService.h"
 
 #include "Animation/Skeleton.h"
+#include "Animation/AnimBlueprint.h"
+#include "Animation/AnimInstance.h"
+#include "Engine/Blueprint.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/SkeletalMeshSocket.h"
 #include "Animation/BlendProfile.h"

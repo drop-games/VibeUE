@@ -5,6 +5,7 @@
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
 #include "UObject/UObjectIterator.h"
+#include "UObject/Package.h"
 #include "Engine/DeveloperSettings.h"
 #include "GameMapsSettings.h"
 #include "GeneralProjectSettings.h"

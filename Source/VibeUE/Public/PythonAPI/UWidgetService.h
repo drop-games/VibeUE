@@ -3,6 +3,8 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Layout/Margin.h"
+#include "Types/SlateEnums.h"
 #include "ToolsetRegistry/ToolsetDefinition.h"
 #include "Types/MVVMBindingMode.h"
 #include "UWidgetService.generated.h"

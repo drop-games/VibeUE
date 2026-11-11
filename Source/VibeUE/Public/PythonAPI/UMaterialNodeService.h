@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "SceneTypes.h"
 #include "ToolsetRegistry/ToolsetDefinition.h"
 #include "UMaterialService.h"
 #include "UMaterialNodeService.generated.h"

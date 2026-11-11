@@ -7,6 +7,7 @@
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "UObject/UObjectIterator.h"
 
 // Enhanced Input includes
 #include "InputAction.h"

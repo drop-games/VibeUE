@@ -13,6 +13,7 @@
 #include "Kismet2/EnumEditorUtils.h"
 #include "Kismet2/StructureEditorUtils.h"
 #include "UserDefinedStructure/UserDefinedStructEditorData.h"
+#include "UObject/TextProperty.h"
 #include "UObject/UObjectIterator.h"
 #include "UObject/StructOnScope.h"
 #include "EdGraph/EdGraphPin.h"

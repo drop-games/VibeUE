@@ -21,6 +21,7 @@
 #pragma warning(pop)
 #endif
 #include "EditorSupportDelegates.h"
+#include "Misc/ConfigCacheIni.h"
 #include "ScopedTransaction.h"
 #include "UObject/PropertyIterator.h"
 

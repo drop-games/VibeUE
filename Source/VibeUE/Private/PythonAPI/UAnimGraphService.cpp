@@ -5,6 +5,7 @@
 #include "Animation/AnimBlueprint.h"
 #include "Animation/AnimBlueprintGeneratedClass.h"
 #include "Animation/AnimSequence.h"
+#include "Engine/SkeletalMesh.h"
 #include "Animation/BlendSpace.h"
 #include "AnimGraphNode_StateMachine.h"
 #include "AnimGraphNode_SequencePlayer.h"

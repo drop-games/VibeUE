@@ -32,8 +32,14 @@
 #include "StateTreeCompilerLog.h"
 #include "Blueprint/StateTreeTaskBlueprintBase.h"
 #include "Blueprint/StateTreeEvaluatorBlueprintBase.h"
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4996) // UE 5.9 marks FStateTreeViewModel's view events experimental.
+#endif
 #include "StateTreeEditingSubsystem.h"
-#include "StateTreeViewModel.h"
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 #include "Editor.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 

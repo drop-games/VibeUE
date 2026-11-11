@@ -7,6 +7,7 @@
 #include "FabEndpoints.h"
 
 #include "UObject/UnrealType.h"
+#include "UObject/StrProperty.h"
 #include "UObject/SoftObjectPath.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"

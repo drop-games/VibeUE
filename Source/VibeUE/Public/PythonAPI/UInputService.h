@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "InputCoreTypes.h"
 #include "ToolsetRegistry/ToolsetDefinition.h"
 #include "UInputService.generated.h"
 

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Animation/Skeleton.h"
 #include "ToolsetRegistry/ToolsetDefinition.h"
 #include "USkeletonService.generated.h"
 

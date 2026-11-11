@@ -3,6 +3,7 @@
 #include "PythonAPI/UMaterialService.h"
 #include "Core/JsonValueHelper.h"
 #include "Materials/Material.h"
+#include "MaterialDomain.h"
 #include "Materials/MaterialInstance.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialExpressionParameter.h"
